@@ -1,0 +1,23 @@
+name: pollinations
+version: 1.4.0
+description: "Pollinations image generation and editing — free classic model with no key; the live Quest-eligible catalog with a Pollinations key; paid models behind an optional toggle"
+author: greythx
+kind: backend
+license: MIT
+homepage: https://github.com/greythx/hermes-pollinations
+tags:
+  - image-generation
+  - pollinations
+  - image-editing
+requires_hermes: ">=0.21.0"
+requires_env:
+  - name: POLLINATIONS_API_KEY
+    description: "Optional — unlocks the Quest-eligible catalog and image editing; the free classic model works without it"
+    url: https://enter.pollinations.ai/keys
+    secret: true
+config_schema:
+  include_paid_models:
+    type: bool
+    default: false
+    label: "Include paid models"
+    description: "Also list paid-only Pollinations models in the picker. Requires a Pollinations API key with a paid balance; free and Quest-eligible models are listed either way."
