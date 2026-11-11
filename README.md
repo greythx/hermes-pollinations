@@ -34,9 +34,9 @@ Reference images can be a URL, a base64 data URI, or an absolute path on your ma
 
 ## Behaviour worth knowing
 
-The model list is fetched from Pollinations each time the picker opens, and cached for an
-hour. Models Pollinations adds or removes show up without a plugin update. Prices, rate
-limits, and the free-model list come from the same catalog.
+The model list is fetched from Pollinations each time the picker opens, and cached briefly.
+Models Pollinations adds or removes show up without a plugin update. Prices, rate limits, and
+the free-model list come from the same catalog.
 
 If the catalog is unreachable and nothing is cached, the plugin offers no model rather than
 guessing at one that may no longer exist.
@@ -47,7 +47,7 @@ The 1K and 2K resolution control appears only for models that publish those tier
 
 - Every request goes to `gen.pollinations.ai` or `image.pollinations.ai`.
 - Prompts and reference images are sent to Pollinations.
-- The free classic route puts a small logo on images and caps output at 768×768 pixels of area.
+- The free classic route puts a small logo on images and caps output at a reduced size.
 - Generated images are written to `$HERMES_HOME/cache/generated/images/`. The model catalog
   and the free-model list are cached under `$HERMES_HOME/cache/`.
 - Paid-only models spend real money from your Pollinations balance. They stay hidden until you
