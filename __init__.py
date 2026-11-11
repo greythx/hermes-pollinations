@@ -12,13 +12,13 @@ degrades instead of raising.
 Transport, chosen per request:
 
 * **free classic** — ``GET https://image.pollinations.ai/prompt/{prompt}``. No key and free,
-  but every image carries the Pollinations logo, requests are throttled to roughly one per
-  45 s per IP, and output is capped at 768x768 pixels of *area* (a 1280x768 request comes back
-  about 991x594). Used only when no key is set.
+  but every image carries the Pollinations logo, requests are throttled per IP, and output is
+  capped at a reduced size. Used only when no key is set.
 * **enter** — ``GET https://gen.pollinations.ai/image/{prompt}`` with ``POLLINATIONS_API_KEY``.
-  No logo and no per-IP limit. Spends Quest Pollen, or Paid Pollen for paid-only models. A
-  model the classic API serves for free is billed this way once a key is set, so the same
-  model is watermarked while keyless and clean once a key is added.
+  No logo and no per-IP throttle. Spends the account's Pollen — Quest Pollen for Quest-eligible
+  models, Paid Pollen for paid-only ones. A model the classic API serves for free is billed this
+  way once a key is set, so the same model is watermarked while keyless and clean once a key is
+  added.
 
 Editing: ``POST https://gen.pollinations.ai/v1/images/edits``. Only the enter API can edit, so
 a key is mandatory; Hermes exposes image inputs for exactly the models whose catalog entry
@@ -82,6 +82,8 @@ CLASSIC_MODELS_URL = "https://image.pollinations.ai/models"
 ENTER_IMAGE_URL = "https://gen.pollinations.ai/image"
 EDIT_URL = "https://gen.pollinations.ai/v1/images/edits"
 CLASSIC_IMAGE_URL = "https://image.pollinations.ai/prompt"
+# The authenticated host, so a catalog-advertised path can be turned into a URL.
+ENTER_BASE_URL = "https://gen.pollinations.ai"
 
 API_KEY_ENVS = ("POLLINATIONS_API_KEY",)
 MODEL_ENV = "POLLINATIONS_IMAGE_MODEL"
@@ -197,7 +199,9 @@ def _include_paid_models(plugin_id: str) -> bool:
         from hermes_cli.config import load_config_readonly
 
         entry = (load_config_readonly() or {}).get("plugins", {}).get("entries", {}).get(plugin_id) or {}
-        return (entry.get("settings") or {}).get(INCLUDE_PAID_KEY) is True
+        # Hermes stores a real bool here, but a profile imported by hand or written by another
+        # version may hold a string; treat the truthy spellings as on and everything else as off.
+        return _as_bool((entry.get("settings") or {}).get(INCLUDE_PAID_KEY))
     except Exception as exc:
         logger.debug("Could not read %s: %s", INCLUDE_PAID_KEY, exc)
         return False
@@ -208,6 +212,29 @@ def _ssrf_client(timeout: float) -> Any:
     from tools.url_safety import create_ssrf_safe_client
 
     return create_ssrf_safe_client(timeout=timeout, follow_redirects=True)
+
+
+def _unwrap_list(payload: Any, keys: tuple) -> Optional[List[Any]]:
+    """The first list a JSON envelope carries, preferring the named keys.
+
+    Third-party envelopes rename their fields, and a rename must not read as an empty response.
+    One level of nesting is followed, so ``{"data": {"models": [...]}}`` resolves too.
+    """
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for key in keys:
+            value = payload.get(key)
+            if isinstance(value, list):
+                return value
+            if isinstance(value, dict):
+                inner = _unwrap_list(value, keys)
+                if inner is not None:
+                    return inner
+        for value in payload.values():
+            if isinstance(value, list):
+                return value
+    return None
 
 
 def _bounded_read(response: Any, url: str, *, limit: int = MAX_RESPONSE_BYTES) -> bytes:
@@ -314,8 +341,8 @@ def _request_failed(exc: Exception, *, action: str, mode: str = "quest",
             if mode == "free":
                 return fail(
                     f"Pollinations returned HTTP {exc.status}{wait} — the free classic route is "
-                    "throttled per IP (about one image per 45 seconds). Wait, or add "
-                    "POLLINATIONS_API_KEY to skip the throttle.", "rate_limited")
+                    "throttled per IP. Wait, or add POLLINATIONS_API_KEY to skip the throttle.",
+                    "rate_limited")
             return fail(
                 f"Pollinations returned HTTP {exc.status}{wait} — the Quest Pollen balance or "
                 "the rate limit was hit. Wait, or check the account at "
@@ -371,7 +398,7 @@ def _catalog() -> List[Dict[str, Any]]:
     try:
         raw = read_json_or_empty(path)
         # A cache written by a different plugin version is ignored rather than trusted.
-        models = (_as_list(raw.get("models"))
+        models = ([entry for entry in _as_list(raw.get("models")) if isinstance(entry, dict)]
                   if raw.get("version", CACHE_SCHEMA) == CACHE_SCHEMA else [])
         if models:
             cached = models
@@ -386,10 +413,11 @@ def _catalog() -> List[Dict[str, Any]]:
     # slow failure would hide a cache another thread has already refreshed.
     started = time.time()
     try:
-        models = _http_get_json(CATALOG_URL)
-        if isinstance(models, dict):
-            models = models.get("data") or models.get("models") or []
-        models = _as_list(models)
+        models = _unwrap_list(_http_get_json(CATALOG_URL),
+                              ("models", "data", "items", "results")) or []
+        # Drop non-object entries at the source, so every consumer can assume a dict rather than
+        # re-checking each element.
+        models = [entry for entry in models if isinstance(entry, dict)]
         if not models:
             # An empty answer is not a catalog. Treating it as authoritative would overwrite a
             # good cache and empty the picker, so it is handled as a failed fetch instead.
@@ -468,12 +496,9 @@ def _classic_models() -> List[str]:
     started = time.time()
     fetched_ids: Optional[List[str]] = None
     try:
-        fetched = _http_get_json(CLASSIC_MODELS_URL)
-        if isinstance(fetched, dict):
-            # The endpoint has returned a bare list so far; accept the wrapped shapes too so a
-            # future envelope does not read as "no free models".
-            fetched = fetched.get("models") or fetched.get("data") or fetched.get("ids") or []
-        if isinstance(fetched, list):
+        fetched = _unwrap_list(_http_get_json(CLASSIC_MODELS_URL),
+                               ("models", "data", "ids", "items", "results"))
+        if fetched is not None:
             # Only strings can become URL path segments; anything else is discarded.
             fetched_ids = [item.strip() for item in fetched
                            if isinstance(item, str) and item.strip()]
@@ -647,17 +672,49 @@ def _catalog_entry(catalog: List[Dict[str, Any]], model: Optional[str]) -> Optio
     return next((m for m in catalog if _name_of(m) == model), None)
 
 
+def _edit_path(entry: Optional[Dict[str, Any]]) -> Optional[str]:
+    """The catalog's advertised edits path, matched by shape rather than by exact literal.
+
+    A version bump upstream (``/v2/images/edits``) would otherwise silently disable every edit,
+    because an exact ``"/v1/images/edits"`` comparison would stop matching.
+    """
+    for endpoint in _as_list((entry or {}).get("supported_endpoints")):
+        if not isinstance(endpoint, str):
+            continue
+        candidate = endpoint.strip()
+        if candidate.lower().endswith("/edits"):
+            return candidate
+    return None
+
+
 def _supports_edits(entry: Optional[Dict[str, Any]]) -> bool:
-    """True when the catalog advertises the edits endpoint for this model."""
-    return "/v1/images/edits" in _as_list(entry.get("supported_endpoints")) if entry else False
+    """True when the catalog advertises an edits endpoint for this model."""
+    return _edit_path(entry) is not None
+
+
+def _edit_url(entry: Optional[Dict[str, Any]]) -> str:
+    """The edits endpoint: the catalog's advertised path when it has one, else the default."""
+    path = _edit_path(entry)
+    if not path:
+        return EDIT_URL
+    if path.startswith(("http://", "https://")):
+        return path
+    return ENTER_BASE_URL + (path if path.startswith("/") else "/" + path)
 
 
 def _reference_cap(entry: Optional[Dict[str, Any]]) -> int:
-    """The catalog's published reference-image cap, ceilinged; 1 when it publishes none."""
+    """The catalog's published reference-image cap, ceilinged; the ceiling when it publishes none.
+
+    The edit models that publish a cap say 10-16, and the ones that publish nothing still accept
+    several, so defaulting to 1 would silently discard references the model could have used.
+    """
+    raw = (entry or {}).get("max_reference_images")
+    if raw is None or raw == "":
+        return MAX_REFERENCE_IMAGES
     try:
-        return max(1, min(int((entry or {}).get("max_reference_images")), MAX_REFERENCE_IMAGES))
+        return max(1, min(int(raw), MAX_REFERENCE_IMAGES))
     except Exception:
-        return 1
+        return MAX_REFERENCE_IMAGES
 
 
 def _published_resolutions(entry: Optional[Dict[str, Any]]) -> set:
@@ -714,7 +771,17 @@ def _format_price(value: Any) -> str:
 
 
 def _advertises_free(model: Dict[str, Any]) -> bool:
-    """True when the catalog's own title or name calls the model free."""
+    """True when the catalog's own price or naming calls the model free.
+
+    A published price of zero is the stronger signal; the name is only a fallback, because a
+    title containing "free" can be marketing copy for a model that is in fact billed.
+    """
+    raw = _as_dict(model.get("pricing")).get("completionImageTokens")
+    try:
+        if float(raw) == 0:
+            return True
+    except (TypeError, ValueError, OverflowError):
+        pass
     text = f"{model.get('title') or ''} {model.get('name') or ''}"
     return re.search(r"\bfree\b", text, re.IGNORECASE) is not None
 
@@ -769,9 +836,27 @@ def _price_label(model: Dict[str, Any], free_classic: bool, has_key: bool) -> st
 
 
 def _iso_date(model: Dict[str, Any]) -> str:
+    """The catalog's ``added_date`` as a day, whatever unit it is in.
+
+    The field is documented as milliseconds, but a switch to seconds would otherwise render every
+    model as 1970, so the magnitude decides.
+    """
+    raw = model.get("added_date")
     try:
-        return time.strftime("%Y-%m-%d", time.gmtime(int(model.get("added_date")) / 1000))
-    except Exception:
+        seconds = float(raw)
+    except (TypeError, ValueError, OverflowError):
+        return ""
+    if not math.isfinite(seconds) or seconds <= 0:
+        return ""
+    # A second-based epoch is 10 digits; a millisecond one is 13. Anything older than the year
+    # 2286 in milliseconds is almost certainly seconds.
+    if abs(seconds) < 10**11:
+        pass
+    else:
+        seconds /= 1000.0
+    try:
+        return time.strftime("%Y-%m-%d", time.gmtime(seconds))
+    except (OverflowError, OSError, ValueError):
         return ""
 
 
@@ -844,6 +929,8 @@ def _resolve_model(explicit: Optional[str], catalog: List[Dict[str, Any]]) -> Op
     config = load_image_gen_config()
     scoped = config.get(PROVIDER_ID)
     shared = config.get("model")
+    has_key = _api_key() is not None
+    classic = _classic_set()
     candidates = [
         explicit,
         os.environ.get(MODEL_ENV, "").strip(),
@@ -854,10 +941,15 @@ def _resolve_model(explicit: Optional[str], catalog: List[Dict[str, Any]]) -> Op
         if isinstance(candidate, str) and candidate.strip() in index:
             return index[candidate.strip()]
     for candidate in candidates[:3]:
-        if (isinstance(candidate, str) and candidate.strip()
-                and candidate.strip() != shared):
-            return candidate.strip()
-    return _derived_default(catalog, _classic_set(), _api_key() is not None)
+        value = candidate.strip() if isinstance(candidate, str) else ""
+        if value and value != shared:
+            # An unknown id passes through so a model added upstream works the day it appears.
+            # Keyless, though, only the free classic route can run it, and an id the catalog
+            # does not know there is far more likely a leftover than a brand-new free model.
+            if has_key or value.lower() in classic:
+                return value
+            logger.debug("Ignoring %r: not a catalog model and not served keyless.", value)
+    return _derived_default(catalog, classic, has_key)
 
 
 def _configured_model(catalog: List[Dict[str, Any]]) -> Optional[str]:
@@ -940,7 +1032,13 @@ def _local_image_to_data_url(value: str) -> str:
         raise ValueError(f"source image path is empty: {value}")
     if size > MAX_INPUT_IMAGE_BYTES:
         raise ValueError(f"source image exceeds {MAX_INPUT_IMAGE_BYTES} bytes")
-    return _encode_input_image(path.read_bytes())
+    # Read with the same ceiling: a file can change between stat() and read(), and a huge file
+    # must not be buffered just because it was small a moment ago.
+    with path.open("rb") as handle:
+        raw = handle.read(MAX_INPUT_IMAGE_BYTES + 1)
+    if len(raw) > MAX_INPUT_IMAGE_BYTES:
+        raise ValueError(f"source image exceeds {MAX_INPUT_IMAGE_BYTES} bytes")
+    return _encode_input_image(raw)
 
 
 def _to_data_url(value: str) -> str:
@@ -1060,6 +1158,7 @@ class _Route(NamedTuple):
     headers: Optional[Dict[str, str]]
     extra: Dict[str, Any]
     error: Optional[str]
+    error_type: str = "auth_required"
 
 
 def _text_to_image_route(
@@ -1074,10 +1173,10 @@ def _text_to_image_route(
 ) -> _Route:
     """Choose the transport for a text-to-image call and build its URL.
 
-    The free classic API is watermarked and throttled to roughly one image per 45 s, so it is
-    the no-key route only. With a key the same model is billed through the enter API — still
-    Quest-eligible, still cheap, but clean and unthrottled. ``error`` is set when the model
-    cannot run under the current credentials.
+    The free classic API is watermarked and throttled per IP, so it is the no-key route only.
+    With a key the same model is billed through the enter API — still Quest-eligible, still
+    cheap, but clean and unthrottled. ``error`` is set when the model cannot run under the
+    current credentials.
     """
     extra: Dict[str, Any] = {"width": width, "height": height}
     classic_id = _classic_id_for(model, catalog) if _api_key() is None else None
@@ -1096,13 +1195,15 @@ def _text_to_image_route(
 
     key = _api_key()
     if key is None:
+        unreachable = _free_route_unavailable()
         reason = (
             "the free model list could not be reached"
-            if _free_route_unavailable()
+            if unreachable
             else f"model '{model}' is not served by the free classic API"
         )
         return _Route(
             url=None, headers=None, extra=extra,
+            error_type=("api_error" if unreachable else "model_unavailable"),
             error=(
                 f"Cannot generate '{model}': {reason}, and no POLLINATIONS_API_KEY is set. "
                 "Add a key (https://enter.pollinations.ai/keys), or pick a model the free "
@@ -1184,8 +1285,10 @@ class PollinationsImageGenProvider(ImageGenProvider):
             for key in [item.strip() for item in _classic_models()
                         if isinstance(item, str) and item.strip()]:
                 if key not in rows:
-                    rows[key] = _specs({"name": key, "category": "image",
-                                        "input_modalities": ["text"]}, True, has_key)
+                    # The classic endpoint publishes no metadata, so the row is built from the id
+                    # alone; ``input_modalities`` states what the route accepts.
+                    rows[key] = _specs({"name": key, "input_modalities": ["text"]},
+                                      True, has_key)
 
         configured = _configured_model(catalog)
         if configured and configured not in rows:
@@ -1275,7 +1378,7 @@ class PollinationsImageGenProvider(ImageGenProvider):
             prompt, model, entry, catalog, width, height, seed,
             str(kwargs.get("resolution") or "").strip().lower())
         if route.error:
-            return fail(route.error, "auth_required")
+            return fail(route.error, route.error_type or "auth_required")
         url, headers, extra = route.url or "", route.headers or {}, route.extra
 
         try:
@@ -1376,7 +1479,7 @@ class PollinationsImageGenProvider(ImageGenProvider):
 
         headers = {"Authorization": f"Bearer {api_key}", "Accept": "application/json"}
         try:
-            answered = _http_post_json(EDIT_URL, headers=headers, payload=payload)
+            answered = _http_post_json(_edit_url(entry), headers=headers, payload=payload)
         except Exception as exc:
             return _request_failed(exc, action="image edit",
                                    mode=("paid" if _as_bool((entry or {}).get("paid_only"))

@@ -9,7 +9,7 @@ The picker lists only models your current setup can run.
 
 | State | What you get |
 | --- | --- |
-| No API key | One free model (whatever the free classic endpoint serves today). Watermarked, and throttled to about one image per 45 seconds per IP. |
+| No API key | One free model (whatever the free classic endpoint serves today). Watermarked, throttled per IP, and capped at a reduced size. |
 | API key added | Every Quest-eligible model Pollinations publishes. No watermark, no per-IP throttle. |
 | Key plus "Include paid models" | The full catalog, paid-only models included. |
 
