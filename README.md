@@ -46,6 +46,9 @@ The 1K and 2K resolution control appears only for models that publish those tier
 ## Disclosure
 
 - Every request goes to `gen.pollinations.ai` or `image.pollinations.ai`.
+- The edits endpoint is pinned to `gen.pollinations.ai`: a model entry that advertises an edits
+  URL on another host, over plain HTTP, or on a non-standard port is ignored and the Pollinations
+  endpoint is used instead, so your key and reference images only ever leave for Pollinations.
 - Prompts and reference images are sent to Pollinations.
 - The free classic route puts a small logo on images and caps output at a reduced size.
 - Generated images are written to `$HERMES_HOME/cache/generated/images/`. The model catalog

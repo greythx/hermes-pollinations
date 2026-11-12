@@ -60,7 +60,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, NamedTuple, Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit, urlunsplit
 
 from agent.image_gen_provider import (
     DEFAULT_ASPECT_RATIO,
@@ -81,9 +81,13 @@ CATALOG_URL = "https://gen.pollinations.ai/image/models"
 CLASSIC_MODELS_URL = "https://image.pollinations.ai/models"
 ENTER_IMAGE_URL = "https://gen.pollinations.ai/image"
 EDIT_URL = "https://gen.pollinations.ai/v1/images/edits"
+EDIT_URL_PATH = "/v1/images/edits"
 CLASSIC_IMAGE_URL = "https://image.pollinations.ai/prompt"
 # The authenticated host, so a catalog-advertised path can be turned into a URL.
 ENTER_BASE_URL = "https://gen.pollinations.ai"
+# The only host a catalog-advertised endpoint may name. Catalog data is fetched from the network,
+# so it is not trusted to choose where the user's key and reference images are sent.
+ENTER_HOST = "gen.pollinations.ai"
 
 API_KEY_ENVS = ("POLLINATIONS_API_KEY",)
 MODEL_ENV = "POLLINATIONS_IMAGE_MODEL"
@@ -207,11 +211,11 @@ def _include_paid_models(plugin_id: str) -> bool:
         return False
 
 
-def _ssrf_client(timeout: float) -> Any:
+def _ssrf_client(timeout: float, *, follow_redirects: bool = True) -> Any:
     """The shared SSRF-guarded client: every outbound request goes through it."""
     from tools.url_safety import create_ssrf_safe_client
 
-    return create_ssrf_safe_client(timeout=timeout, follow_redirects=True)
+    return create_ssrf_safe_client(timeout=timeout, follow_redirects=follow_redirects)
 
 
 def _unwrap_list(payload: Any, keys: tuple) -> Optional[List[Any]]:
@@ -370,8 +374,14 @@ def _http_get_bytes(url: str, *, headers: Optional[Dict[str, str]] = None,
 
 def _http_post_json(url: str, *, headers: Dict[str, str], payload: Dict[str, Any],
                     timeout: float = HTTP_TIMEOUT) -> Any:
-    """POST JSON to *url* through the SSRF guard with a hard size ceiling."""
-    with _ssrf_client(timeout) as client:
+    """POST JSON to *url* through the SSRF guard with a hard size ceiling.
+
+    Redirects are not followed. This is the edits call, and it carries the user's API key and
+    their reference images: the SSRF guard blocks private targets but allows public ones, so a
+    redirect would forward the payload to a host the endpoint chose. An edits endpoint answers
+    directly, so a 3xx is surfaced as the error it is.
+    """
+    with _ssrf_client(timeout, follow_redirects=False) as client:
         with client.stream("POST", url, headers=headers, json=payload) as response:
             if response.status_code >= 400:
                 raise _HTTPError(url, response.status_code, _body_preview(response),
@@ -605,8 +615,13 @@ TEXT_LIMIT = 4096
 
 
 def _is_number(value: Any) -> bool:
-    """True for a finite int/float. JSON ``NaN``/``Infinity`` are floats but never usable here."""
-    if not isinstance(value, (int, float)):
+    """True for a finite int/float. JSON ``NaN``/``Infinity`` are floats but never usable here.
+
+    ``bool`` is a subclass of ``int``, so without the guard a catalog that publishes
+    ``"per_user_rpm": true`` would render as a rate limit and ``"completionImageTokens": true``
+    would price the model at one pollen.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         return False
     try:
         return math.isfinite(value)
@@ -676,12 +691,14 @@ def _edit_path(entry: Optional[Dict[str, Any]]) -> Optional[str]:
     """The catalog's advertised edits path, matched by shape rather than by exact literal.
 
     A version bump upstream (``/v2/images/edits``) would otherwise silently disable every edit,
-    because an exact ``"/v1/images/edits"`` comparison would stop matching.
+    because an exact ``"/v1/images/edits"`` comparison would stop matching. A query or fragment
+    is not part of a path, so it is stripped before matching; otherwise an endpoint advertised
+    with one would not match at all and every edit would silently use the built-in default.
     """
     for endpoint in _as_list((entry or {}).get("supported_endpoints")):
         if not isinstance(endpoint, str):
             continue
-        candidate = endpoint.strip()
+        candidate = endpoint.strip().split("?", 1)[0].split("#", 1)[0].strip()
         if candidate.lower().endswith("/edits"):
             return candidate
     return None
@@ -693,13 +710,37 @@ def _supports_edits(entry: Optional[Dict[str, Any]]) -> bool:
 
 
 def _edit_url(entry: Optional[Dict[str, Any]]) -> str:
-    """The edits endpoint: the catalog's advertised path when it has one, else the default."""
+    """The edits endpoint: a catalog path on Pollinations' own host, else the built-in default.
+
+    Catalog data is fetched from the network, so it is not trusted to choose where the user's API
+    key and reference images are sent. An absolute endpoint from it is accepted only when it names
+    Pollinations' own host over TLS on the standard port, with no credentials embedded; a relative
+    path is joined to the authenticated base. Anything else — another host, plain HTTP, a non
+    standard port, userinfo — falls back to ``EDIT_URL`` rather than being requested.
+    """
     path = _edit_path(entry)
     if not path:
         return EDIT_URL
-    if path.startswith(("http://", "https://")):
-        return path
-    return ENTER_BASE_URL + (path if path.startswith("/") else "/" + path)
+    try:
+        parsed = urlsplit(path)
+        port = parsed.port
+    except ValueError:
+        # A malformed port or bracket makes urlsplit refuse the value; do not guess at it.
+        return EDIT_URL
+    if parsed.scheme or parsed.netloc:
+        if (parsed.scheme.lower() != "https"
+                or (parsed.hostname or "").lower() != ENTER_HOST
+                or port not in (None, 443)
+                or parsed.username is not None
+                or parsed.password is not None):
+            return EDIT_URL
+        # Rebuild from the host constant rather than echoing the catalog's netloc, so a value that
+        # somehow matched above cannot smuggle a second host or a fragment into the request.
+        return urlunsplit(("https", ENTER_HOST, parsed.path or EDIT_URL_PATH, "", ""))
+    # A relative path may carry its own query or fragment; neither belongs in an endpoint we
+    # construct, and a fragment would silently truncate the path for urlsplit-based consumers.
+    clean = path.split("?", 1)[0].split("#", 1)[0]
+    return ENTER_BASE_URL + (clean if clean.startswith("/") else "/" + clean)
 
 
 def _reference_cap(entry: Optional[Dict[str, Any]]) -> int:
@@ -709,7 +750,7 @@ def _reference_cap(entry: Optional[Dict[str, Any]]) -> int:
     several, so defaulting to 1 would silently discard references the model could have used.
     """
     raw = (entry or {}).get("max_reference_images")
-    if raw is None or raw == "":
+    if raw is None or raw == "" or isinstance(raw, bool):
         return MAX_REFERENCE_IMAGES
     try:
         return max(1, min(int(raw), MAX_REFERENCE_IMAGES))
@@ -748,11 +789,11 @@ def _classic_id_for(model: str, catalog: List[Dict[str, Any]]) -> Optional[str]:
 
 def _price_value(model: Dict[str, Any]) -> float:
     """Numeric pollen price for ordering; unpublished prices sort as zero (cheapest)."""
-    try:
-        amount = float(_as_dict(model.get("pricing")).get("completionImageTokens"))
-    except (TypeError, ValueError, OverflowError):
+    raw = _as_dict(model.get("pricing")).get("completionImageTokens")
+    if not _is_number(raw):
         return 0.0
-    return amount if math.isfinite(amount) and amount >= 0 else 0.0
+    amount = float(raw)
+    return amount if amount >= 0 else 0.0
 
 
 def _format_price(value: Any) -> str:
@@ -842,11 +883,10 @@ def _iso_date(model: Dict[str, Any]) -> str:
     model as 1970, so the magnitude decides.
     """
     raw = model.get("added_date")
-    try:
-        seconds = float(raw)
-    except (TypeError, ValueError, OverflowError):
+    if not _is_number(raw):
         return ""
-    if not math.isfinite(seconds) or seconds <= 0:
+    seconds = float(raw)
+    if seconds <= 0:
         return ""
     # A second-based epoch is 10 digits; a millisecond one is 13. Anything older than the year
     # 2286 in milliseconds is almost certainly seconds.
@@ -867,8 +907,8 @@ def _index(catalog: List[Dict[str, Any]]) -> Dict[str, str]:
         name = _name_of(model) if isinstance(model, dict) else None
         if not name:
             continue
-        for key in [name, *[a.strip() for a in _as_list(model.get("aliases"))
-                             if isinstance(a, str) and a.strip()]]:
+        for key in [name, *[clean for a in _as_list(model.get("aliases"))
+                             if (clean := _text(a))]]:
             if key in out and out[key] != name:
                 logger.debug("Pollinations catalog reuses %r for both %r and %r; keeping %r.",
                              key, out[key], name, out[key])
@@ -1006,7 +1046,10 @@ def _remote_image_to_data_url(value: str) -> str:
     from tools.url_safety import is_safe_url
 
     if not is_safe_url(value):
-        raise ValueError(f"source image URL failed the SSRF safety check: {value}")
+        # The URL can carry a signed query string, so it is logged for the operator rather than
+        # echoed into the error the agent sees.
+        logger.debug("Source image URL failed the SSRF safety check: %s", value)
+        raise ValueError("source image URL failed the SSRF safety check")
     with _ssrf_client(60.0) as client:
         with client.stream("GET", value) as response:
             response.raise_for_status()
@@ -1127,21 +1170,21 @@ def _specs(model: Dict[str, Any], free_classic: bool, has_key: bool) -> Dict[str
         "community": _as_bool(model.get("community")),
         "description": description,
         "strengths": strengths[:STRENGTHS_LIMIT],
-        "aliases": [a.strip() for a in _as_list(model.get("aliases"))
-                    if isinstance(a, str) and a.strip()],
+        "aliases": [clean for a in _as_list(model.get("aliases")) if (clean := _text(a))],
         "price": _price_label(model, free_classic, has_key),
         "price_pollen": _price_value(model),
         "rpm": rpm if _is_number(rpm) else "",
         "speed": speed,
-        "modalities": [m.strip() for m in _as_list(model.get("input_modalities"))
-                       if isinstance(m, str) and m.strip()],
-        "endpoints": [e.strip() for e in _as_list(model.get("supported_endpoints"))
-                      if isinstance(e, str) and e.strip()],
+        "modalities": [clean for m in _as_list(model.get("input_modalities"))
+                       if (clean := _text(m))],
+        "endpoints": [clean for e in _as_list(model.get("supported_endpoints"))
+                      if (clean := _text(e))],
         "health": {
             "status": _text(health.get("status")),
             "success_rate": round(success_rate, 1) if _is_number(success_rate) else None,
             "requests": (health.get("requests")
-                         if isinstance(health.get("requests"), int) else None),
+                         if isinstance(health.get("requests"), int)
+                         and not isinstance(health.get("requests"), bool) else None),
         },
         "added": _iso_date(model),
         "flat_rate": _as_bool(model.get("flat_rate")),
