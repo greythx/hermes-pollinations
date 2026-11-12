@@ -332,6 +332,11 @@ def _request_failed(exc: Exception, *, action: str, mode: str = "quest",
     if isinstance(exc, _HTTPError):
         logger.debug("Pollinations %s (%s): HTTP %s", action, mode, exc.status, exc_info=True)
         wait = f", retry in ~{exc.retry_after}s" if exc.retry_after else ""
+        # The upstream body is already reduced to a short, control-character-free preview, so it is
+        # safe to show. A 402 on this API is not always an empty balance and a 402/429 is not always
+        # a rate limit — guessing between the two sent a user with an invalid model to check their
+        # Pollen balance. The status is named, then the reason Pollinations gave.
+        detail = f": {exc.body}" if exc.body else ""
         if exc.status == 401:
             if mode == "free":
                 return fail(
@@ -339,19 +344,18 @@ def _request_failed(exc: Exception, *, action: str, mode: str = "quest",
                     "route may now require a key. Add POLLINATIONS_API_KEY, or pick a model the "
                     "free API serves.", "auth_required")
             return fail(
-                "Pollinations rejected the API key (401). Check POLLINATIONS_API_KEY.",
+                f"Pollinations rejected the API key (401){detail}. Check POLLINATIONS_API_KEY.",
                 "auth_required")
         if exc.status in (402, 429):
             if mode == "free":
                 return fail(
-                    f"Pollinations returned HTTP {exc.status}{wait} — the free classic route is "
-                    "throttled per IP. Wait, or add POLLINATIONS_API_KEY to skip the throttle.",
-                    "rate_limited")
+                    f"Pollinations returned HTTP {exc.status}{wait}{detail} — the free classic "
+                    "route is throttled per IP. Wait, or add POLLINATIONS_API_KEY to skip the "
+                    "throttle.", "rate_limited")
             return fail(
-                f"Pollinations returned HTTP {exc.status}{wait} — the Quest Pollen balance or "
-                "the rate limit was hit. Wait, or check the account at "
+                f"Pollinations returned HTTP {exc.status}{wait}{detail} — usually the Quest "
+                "Pollen balance or the rate limit. Wait, or check the account at "
                 "https://enter.pollinations.ai.", "rate_limited")
-        detail = f": {exc.body}" if exc.body else ""
         return fail(f"Pollinations returned HTTP {exc.status}{detail}", "api_error")
     logger.debug("Pollinations %s (%s) failed", action, mode, exc_info=True)
     # The raw exception can carry a URL with signed query parameters or a parser's wording, so
