@@ -798,11 +798,12 @@ def _price_value(model: Dict[str, Any]) -> float:
 
 def _format_price(value: Any) -> str:
     """Plain-decimal pollen amount; never scientific notation."""
-    try:
-        amount = float(value)
-    except (TypeError, ValueError, OverflowError):
+    # ``bool`` is a subclass of ``int``, so it is excluded explicitly: a catalog that publishes
+    # ``true`` as a price is not charging one pollen.
+    if isinstance(value, bool) or not _is_number(value):
         return "No published price"
-    if not math.isfinite(amount) or amount < 0:
+    amount = float(value)
+    if amount < 0:
         return "No published price"
     if amount == 0:
         return "Free"
@@ -849,7 +850,7 @@ def _price_label(model: Dict[str, Any], free_classic: bool, has_key: bool) -> st
         if paid_only:
             return "Free on the classic route · watermark · reduced size · no key needed"
         return "Free · watermark · reduced size · no key needed"
-    if raw is None:
+    if not _is_number(raw):
         # A title that says "free" describes the free classic route; once a key is set this model
         # is billed through the enter API, so the label must not imply it is free.
         cost = ("No published price" if has_key
