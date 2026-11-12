@@ -9,8 +9,8 @@ The picker lists only models your current setup can run.
 
 | State | What you get |
 | --- | --- |
-| No API key | One free model (whatever the free classic endpoint serves today). Watermarked, throttled per IP, and capped at a reduced size. |
-| API key added | Every Quest-eligible model Pollinations publishes. No watermark, no per-IP throttle. |
+| No API key | The model the free route serves today. Watermarked, throttled per IP, and capped at a reduced size. |
+| API key added | The rest of the catalog Pollinations publishes. No watermark, no per-IP throttle. |
 | Key plus "Include paid models" | The full catalog, paid-only models included. |
 
 The toggle sits under Desktop → Settings → Plugins → Pollinations. It ships off.
@@ -24,7 +24,7 @@ hermes config set image_gen.provider pollinations
 ```
 
 To unlock the catalog, get a key at https://enter.pollinations.ai/keys and save it as
-`POLLINATIONS_API_KEY`. The free model does not need it.
+`POLLINATIONS_API_KEY`. The free route does not need it.
 
 ## Editing
 
@@ -41,7 +41,7 @@ the free-model list come from the same catalog.
 If the catalog is unreachable and nothing is cached, the plugin offers no model rather than
 guessing at one that may no longer exist.
 
-The 1K and 2K resolution control appears only for models that publish those tiers.
+The resolution control appears only for models that publish a tier Hermes can express.
 
 ## Disclosure
 
@@ -50,7 +50,7 @@ The 1K and 2K resolution control appears only for models that publish those tier
   URL on another host, over plain HTTP, or on a non-standard port is ignored and the Pollinations
   endpoint is used instead, so your key and reference images only ever leave for Pollinations.
 - Prompts and reference images are sent to Pollinations.
-- The free classic route puts a small logo on images and caps output at a reduced size.
+- The free route watermarks images and caps output at a reduced size.
 - Generated images are written to `$HERMES_HOME/cache/generated/images/`. The model catalog
   and the free-model list are cached under `$HERMES_HOME/cache/`.
 - Paid-only models spend real money from your Pollinations balance. They stay hidden until you
