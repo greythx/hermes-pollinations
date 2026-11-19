@@ -5,7 +5,9 @@ image-gen backend. It works with no account. A key unlocks the full catalog.
 
 ## Three states
 
-The picker lists only models your current setup can run.
+The picker lists only models your current setup can run — except your saved model,
+which stays visible so it never silently disappears. Generation still refuses what the
+current state forbids.
 
 | State | What you get |
 | --- | --- |
@@ -15,7 +17,9 @@ The picker lists only models your current setup can run.
 
 The toggle sits under Desktop → Settings → Plugins → Pollinations. It ships off. While it is
 off, paid-only models are both hidden from the picker and refused at generation time. A model
-id the catalog does not list cannot be classified and is sent as-is.
+id the catalog does not list cannot be classified and is sent as-is — except an unknown shared
+`image_gen.model` value, which falls back to the live default (it is usually another provider's
+leftover id), unless the free classic API serves it.
 
 ## Setup
 
@@ -36,21 +40,25 @@ Reference images can be a URL, a base64 data URI, or an absolute path on your ma
 
 ## Behaviour worth knowing
 
-The model list is fetched live from Pollinations and cached for up to an hour.
-Models Pollinations adds or removes show up without a plugin update. Prices, rate limits, and
-the free-model list come from the same catalog.
+The model list is fetched live from Pollinations and cached for an hour; if Pollinations is
+unreachable, the last good list keeps serving rather than guessing. Models Pollinations adds or
+removes show up without a plugin update. Prices and rate limits come from the catalog; the
+free-model list is read live from the classic API (`image.pollinations.ai/models`). The edit
+prompt length limit and the seed range are read live from the published API spec.
 
 Rows are ordered by estimated per-image cost: per-image and per-megapixel prices are
 normalized to a per-image figure, per-token models follow them (the catalog publishes no token
 count to compare with), and models with no published price sort last.
 
-A caller-provided `seed` is honored for reproducible images; otherwise each call gets a fresh
-random seed.
+A caller-provided `seed` is honored for reproducible images on models that support it, when
+passed programmatically (the `image_generate` tool does not expose one); otherwise each call
+gets a fresh random seed.
 
 If the catalog is unreachable and nothing is cached, the plugin offers no model rather than
 guessing at one that may no longer exist.
 
-The resolution control appears only for models that publish a tier Hermes can express.
+The resolution control appears only with a key set, for models that publish a tier Hermes
+can express (1K/2K).
 
 ## Disclosure
 
@@ -61,15 +69,17 @@ The resolution control appears only for models that publish a tier Hermes can ex
 - The edits endpoint is pinned to `gen.pollinations.ai`: a model entry that advertises an edits
   URL on another host, over plain HTTP, or on a non-standard port is ignored and the Pollinations
   endpoint is used instead, so your key and reference images only ever leave for Pollinations.
-- Prompts and reference images are sent to Pollinations.
+- Prompts and reference images are sent to Pollinations. Generation prompts travel in the
+  request URL path (they may appear in intermediary access logs); edit prompts travel in the
+  request body.
 - The free route watermarks images and caps output at a reduced size.
 - Generated images are written to `$HERMES_HOME/cache/generated/images/`. The model catalog
   and the free-model list are cached under `$HERMES_HOME/cache/`.
 - Paid-only models spend real money from your Pollinations balance. They stay hidden and are
   refused at generation time until you turn the toggle on. A model id the catalog does not
-  list cannot be classified and is sent as-is.
-- There is no telemetry or analytics. The only outbound traffic is the Pollinations API calls
-  listed above.
+  list cannot be classified and is sent as-is (with the shared-config exception above).
+- There is no telemetry or analytics. Outbound traffic is limited to the Pollinations API
+  calls listed above and the reference-image hosts you supply.
 
 ## License
 

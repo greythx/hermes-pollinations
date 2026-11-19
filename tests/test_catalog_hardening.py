@@ -321,6 +321,14 @@ def test_cache_entries_without_ids_are_not_a_fresh_hit():
     assert [m["name"] for m in got] == ["fresh/model"], got
 
 
+def test_iso_date_absurd_year_blank():
+    mod = _require()
+    for raw in (1e18, 2**63, 1e15, -5, 0):
+        assert mod._iso_date({"added_date": raw}) == "", raw
+    assert mod._iso_date({"added_date": 1759795200000}) == "2025-10-07"
+    assert mod._iso_date({"added_date": 1759795200}) == "2025-10-07"
+
+
 def _main() -> int:
     tests = [(name, fn) for name, fn in sorted(globals().items())
              if name.startswith("test_") and callable(fn)]

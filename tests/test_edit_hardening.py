@@ -1,6 +1,6 @@
 """Regression tests for edit-path hardening (audit m2, m5, m6, m11, m13, F10, F7).
 
-Edit prompts obey the spec's 32000-char limit; duplicate sources are deduped;
+Edit prompts obey the live spec's prompt limit; duplicate sources are deduped;
 unpublished reference caps default conservatively; the payload budget is
 accounted BEFORE base64 blow-up and includes the prompt; unsafe response URLs
 are refused; the usage block reaches the core's token accounting; a caller seed
@@ -59,7 +59,8 @@ def _edit_setup(mod, *, entry_extra=None, post_response=None):
     for name in ("_api_key", "load_image_gen_config", "_catalog", "_classic_models",
                  "_include_paid_models", "_to_data_url", "_http_post_json", "_http_get_bytes",
                  "_http_get_image", "cache_url_best_effort", "record_token_usage",
-                 "save_b64_image", "MAX_INPUT_IMAGE_BYTES", "MAX_EDIT_PAYLOAD_BYTES"):
+                 "save_b64_image", "MAX_INPUT_IMAGE_BYTES", "MAX_EDIT_PAYLOAD_BYTES",
+                 "_spec_limits"):
         _ORIG.setdefault(name, getattr(mod, name, None))
         if _ORIG[name] is not None:
             setattr(mod, name, _ORIG[name])
@@ -72,6 +73,8 @@ def _edit_setup(mod, *, entry_extra=None, post_response=None):
     setattr(mod, "_catalog", lambda: [entry])
     setattr(mod, "_classic_models", lambda: [])
     setattr(mod, "_include_paid_models", lambda pid: False)
+    setattr(mod, "_spec_limits",
+            lambda: {"edit_prompt_max": 32000, "seed_min": -1, "seed_max": 2147483647})
     setattr(mod, "_to_data_url", lambda v, limit=1000000: f"data:image/png;base64,{PNG_B64}")
     setattr(mod, "save_b64_image",
             lambda b64, *, prefix="image", extension="png": f"/tmp/{prefix}_test.{extension}")
@@ -268,13 +271,13 @@ def test_edit_seed_kwarg_honored():
 def test_edit_invalid_seed_falls_back_to_random():
     mod = _require()
     _, captured = _edit_setup(mod)
-    for bad in (True, -1, 2**31, "42", None):
+    for bad in (True, 2**31, "42", None):
         res = mod.PollinationsImageGenProvider().generate(
             "edit", model="test/edit-model", image_url="https://example.com/a.png", seed=bad)
         assert res["success"] is True, res
         seed = captured["payload"]["seed"]
         # type() is int, not isinstance: True is an int subclass and must not pass as a seed.
-        assert type(seed) is int and 0 <= seed <= mod.SEED_MAX, (bad, seed)
+        assert type(seed) is int and 0 <= seed <= 2147483647, (bad, seed)
 
 
 def test_usage_recorded_even_when_save_fails():
@@ -295,6 +298,52 @@ def test_usage_recorded_even_when_save_fails():
     assert res["error_type"] == "io_error", res
     # The upstream edit completed and billed tokens; a local save failure must not lose that.
     assert recorded == [usage], recorded
+
+
+def test_edit_inband_error_url_redacted():
+    mod = _require()
+    _edit_setup(mod, post_response={"error": {"message":
+        "fetch failed https://cdn.example/img?sig=SUPERSECRET"}})
+    res = mod.PollinationsImageGenProvider().generate(
+        "edit", model="test/edit-model", image_url="https://example.com/a.png")
+    assert res["success"] is False, res
+    assert "SUPERSECRET" not in res["error"], res
+    assert "[url]" in res["error"], res
+
+
+def test_edit_inband_error_escaped_url_redacted():
+    mod = _require()
+    _edit_setup(mod, post_response={"error": {"message":
+        "fetch failed https:\\/\\/cdn.example/img?sig=ESCAPED"}})
+    res = mod.PollinationsImageGenProvider().generate(
+        "edit", model="test/edit-model", image_url="https://example.com/a.png")
+    assert res["success"] is False, res
+    assert "ESCAPED" not in res["error"], res
+    assert "[url]" in res["error"], res
+
+
+def test_edit_inband_error_string_redacted():
+    mod = _require()
+    _edit_setup(mod, post_response={"error": "failed https://x.example/i?sig=STR"})
+    res = mod.PollinationsImageGenProvider().generate(
+        "edit", model="test/edit-model", image_url="https://example.com/a.png")
+    assert res["success"] is False, res
+    assert "STR" not in res["error"], res
+    assert "[url]" in res["error"], res
+
+
+def test_published_zero_cap_disables_edits():
+    mod = _require()
+    entry, _ = _edit_setup(mod, entry_extra={"max_reference_images": 0})
+    assert mod._reference_cap(entry) == 0
+    assert mod._supports_edits(entry) is False
+    prov = mod.PollinationsImageGenProvider()
+    caps = prov.capabilities()
+    assert caps["modalities"] == ["text"], caps
+    assert caps["max_reference_images"] == 0, caps
+    res = prov.generate("edit", model="test/edit-model", image_url="https://example.com/a.png")
+    assert res["success"] is False, res
+    assert res["error_type"] == "unsupported", res
 
 
 def _main() -> int:

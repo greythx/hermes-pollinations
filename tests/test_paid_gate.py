@@ -65,6 +65,7 @@ def _setup(mod, *, key: "str | None" = "sk_dummy", include_paid=False):
     mod._catalog = lambda: [dict(PAID), dict(QUEST)]
     mod._classic_models = lambda: []
     mod._include_paid_models = lambda pid: include_paid
+    mod._spec_limits = lambda: {"edit_prompt_max": 32000, "seed_min": -1, "seed_max": 2147483647}
     calls = []
 
     def _get(url, *, headers=None, timeout=120.0):
