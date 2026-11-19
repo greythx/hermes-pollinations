@@ -27,6 +27,10 @@ images may be URLs, base64 data URIs or local paths, each guarded, sized and inl
 URIs in a single JSON call. The 1K/2K ``resolution`` creative control is offered only when the
 configured model publishes one of those values and the authenticated route can honour it.
 
+API limits are live too: the edit prompt length and the seed range (including the ``-1``
+sentinel) are read from the published OpenAPI spec and cached; when the spec cannot be
+reached the plugin skips its client-side pre-checks and lets the server enforce its contract.
+
 Selection: ``model`` kwarg → ``POLLINATIONS_IMAGE_MODEL`` → ``image_gen.pollinations.model``
 → ``image_gen.model`` → the free classic model, else the first Quest-eligible one. Catalog ids
 *and* aliases resolve; an unknown id passes through verbatim, so a model added upstream works
@@ -82,8 +86,13 @@ from utils import atomic_json_write, read_json_or_empty
 
 logger = logging.getLogger(__name__)
 
+# Warn once per process about an unscoped secret read (see _api_key).
+_UNSCOPED_WARNED = False
+
 CATALOG_URL = "https://gen.pollinations.ai/image/models"
 CLASSIC_MODELS_URL = "https://image.pollinations.ai/models"
+# The published API contract: the edit prompt limit and seed range are read from here live.
+SPEC_URL = "https://gen.pollinations.ai/openapi.json"
 ENTER_IMAGE_URL = "https://gen.pollinations.ai/image"
 EDIT_URL = "https://gen.pollinations.ai/v1/images/edits"
 EDIT_URL_PATH = "/v1/images/edits"
@@ -102,6 +111,8 @@ PROVIDER_ID = "pollinations"
 PLUGIN_ID = "image_gen/pollinations"
 INCLUDE_PAID_KEY = "include_paid_models"
 CATALOG_TTL = 3600
+# The spec changes rarely; a daily refresh still follows upstream without a plugin edit.
+SPEC_TTL = 86400
 HTTP_TIMEOUT = 120.0
 
 # Source images are inlined into the edits payload as data URIs, so they are capped before the
@@ -111,13 +122,14 @@ ACCEPTED_INPUT_MIME = frozenset({"image/png", "image/jpeg", "image/gif", "image/
 # Hermes' resolution creative control can only express these two values.
 RESOLUTION_VOCAB = frozenset({"1k", "2k"})
 # The reference cap comes from the untrusted catalog, so it is ceilinged here; the bundled edit
-# plugin uses the same bound.
+# plugin uses the same bound. Caps observed to date range 1-16; the spec publishes no upper
+# bound, so the ceiling is a client guard, not an API fact.
 MAX_REFERENCE_IMAGES = 16
-# Default reference cap for edit models that publish none: conservative, because community
-# endpoints commonly accept a single image. Published caps (1-16) are always honored.
+# Default reference cap for edit models that publish none: a judgment call — community
+# endpoints commonly accept a single image, but over-sending surfaces as a server 400 with a
+# readable preview rather than failing silently. Published caps are always honored; a
+# published 0 means the model accepts no reference images and disables edits for that entry.
 DEFAULT_REFERENCE_CAP = 4
-# The edits API's published prompt limit (OpenAPI maxLength on the edits requestBody).
-EDIT_PROMPT_LIMIT = 32000
 # Every response body is bounded before it is buffered, decoded or written to the cache.
 MAX_RESPONSE_BYTES = 25 * 1024 * 1024
 # Total inlined reference images for one edit, plus the prompt and JSON framing. A conservative
@@ -131,8 +143,10 @@ _DATA_URI_HEADER_BYTES = 64
 _MIN_SOURCE_BYTES = 64
 # How long a failed free-model lookup is remembered, so a down endpoint is not retried per call.
 NEGATIVE_TTL = 60.0
-# Pollinations accepts a 32-bit signed seed.
-SEED_MAX = 2**31 - 1
+# Fallback entropy bound for a fresh random seed when the live spec range is unknown —
+# a safe default within the current spec, not a claim about it. Caller seeds are validated
+# against the range read live from the published OpenAPI spec.
+_RANDOM_SEED_MAX = 2**31 - 1
 # Picker column widths: strengths is truncated to keep the row readable.
 STRENGTHS_LIMIT = 120
 # How many edit-capable models an error message names.
@@ -182,7 +196,16 @@ def _api_key() -> Optional[str]:
         try:
             value = str(get_secret(name) or "").strip()
         except UnscopedSecretError:
-            logger.debug("No secret scope bound for %s; treating it as unset.", name)
+            # Deliberate keyless degradation, but under multiplexing this can also mean a
+            # spawn-site scoping bug: warn once so it is visible, then stay quiet.
+            global _UNSCOPED_WARNED
+            if not _UNSCOPED_WARNED:
+                _UNSCOPED_WARNED = True
+                logger.warning("No secret scope bound for %s; treating it as unset. Under "
+                               "multiplexing this can indicate a scoping bug at the spawn site.",
+                               name)
+            else:
+                logger.debug("No secret scope bound for %s; treating it as unset.", name)
             continue
         except Exception as exc:
             # A backend failure is not the same as an absent key: warn, so a keyed setup that
@@ -343,10 +366,11 @@ def _read_prefix(response: Any, limit: int) -> bytes:
     return b"".join(chunks)
 
 
-# URLs in raw error text can be JSON-escaped (https:\/\/ or https:\/), so the
-# redaction matches every escaped form of the two slashes, and stops at whitespace or a quote
-# so a compact JSON body does not redact past the string it is in.
-_URL_SLASH = r"(?:\\?/|\\u002[fF])"
+# URLs in raw error text can be JSON-escaped (https:\/\/ or https:\/), and a JSON string
+# embedded in another JSON string doubles the backslashes (https:\\/\\/). The redaction
+# matches any number of backslashes before each slash (or \u002f spell), and stops at
+# whitespace or a quote so a compact JSON body does not redact past the string it is in.
+_URL_SLASH = r"(?:\\*/|\\*u002[fF])"
 _URL_RE = re.compile(r"https?:" + _URL_SLASH + r"{2}[^\s\"']*", re.IGNORECASE)
 
 
@@ -423,7 +447,7 @@ def _request_failed(exc: Exception, *, action: str, mode: str = "quest",
             if (_api_key() or "").lower().startswith("pk_"):
                 return fail(
                     f"Pollinations rejected the key (401){detail}. pk_ app keys only identify an "
-                    "app and no longer authenticate requests (since 2026-11-01). Use a secret "
+                    "app and do not authenticate requests. Use a secret "
                     "sk_ key from https://enter.pollinations.ai/keys as POLLINATIONS_API_KEY.",
                     "auth_required")
             return fail(
@@ -509,6 +533,42 @@ def _parse_image_dimensions(value: Any) -> Optional[tuple[int, int]]:
     return (width, height) if width > 0 and height > 0 else None
 
 
+def _jpeg_dimensions(raw: bytes) -> Optional[tuple[int, int]]:
+    """Actual pixel size from a JPEG's SOF marker, stdlib-only.
+
+    The classic route clamps output area server-side without announcing it (no
+    X-Image-Dimensions header), so the produced size is measured from the bytes themselves.
+    A structural scan, not a decode: malformed data returns None and the caller keeps the
+    requested dimensions.
+    """
+    if not raw.startswith(b"\xff\xd8"):
+        return None
+    pos, n = 2, len(raw)
+    while pos + 4 <= n:
+        if raw[pos] != 0xFF:
+            return None
+        marker = raw[pos + 1]
+        pos += 2
+        if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:
+            continue  # standalone markers carry no length
+        if marker in (0xDA, 0xD9):
+            return None  # scan data / end without a SOF
+        if pos + 2 > n:
+            return None
+        length = int.from_bytes(raw[pos:pos + 2], "big")
+        if length < 2:
+            return None
+        if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+                      0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+            if pos + 7 > n:
+                return None
+            height = int.from_bytes(raw[pos + 3:pos + 5], "big")
+            width = int.from_bytes(raw[pos + 5:pos + 7], "big")
+            return (width, height) if width > 0 and height > 0 else None
+        pos += length
+    return None
+
+
 def _http_get_image(url: str, *, headers: Optional[Dict[str, str]] = None,
                     timeout: float = HTTP_TIMEOUT) -> tuple[bytes, Optional[tuple[int, int]]]:
     """GET an image through the SSRF guard, reporting the produced size when the API sends it.
@@ -527,15 +587,22 @@ def _http_get_image(url: str, *, headers: Optional[Dict[str, str]] = None,
 
 
 def _seed_from(kwargs: Dict[str, Any]) -> int:
-    """A caller-provided seed when it is a valid 32-bit value, else a fresh random one.
+    """A caller-provided seed within the live spec range, else a fresh random one.
 
-    The transport accepts seed, so reproducible generations are possible; a bool is not a seed,
-    and out-of-range or non-integer values fall back to random instead of erroring.
+    The range (including the -1 sentinel) is read from the published spec, so a widened or
+    narrowed range follows upstream without a plugin edit; reproducible generations are
+    possible on models that honor seed. A bool is not a seed. Out-of-range or non-integer
+    values fall back to random instead of erroring. When the spec range is unknown the
+    caller's int passes through verbatim and the server validates it.
     """
     raw = kwargs.get("seed")
-    if isinstance(raw, int) and not isinstance(raw, bool) and 0 <= raw <= SEED_MAX:
-        return raw
-    return random.randint(0, SEED_MAX)
+    limits = _spec_limits()
+    lo, hi = limits["seed_min"], limits["seed_max"]
+    if isinstance(raw, int) and not isinstance(raw, bool):
+        if lo is None or hi is None or lo <= raw <= hi:
+            return raw
+    top = hi if hi is not None else _RANDOM_SEED_MAX
+    return random.randint(0, top)
 
 
 _CATALOG_CACHE: Dict[str, Any] = {"negative_until": 0.0, "last_success": 0.0}
@@ -688,7 +755,14 @@ def _classic_models() -> List[str]:
                                ("models", "data", "ids", "items", "results"))
         if fetched is not None:
             # Only guarded strings can become URL path segments; anything else is discarded.
-            fetched_ids = [item.strip() for item in fetched if _valid_id(item)]
+            valid = [item.strip() for item in fetched if _valid_id(item)]
+            if fetched and not valid:
+                # A non-empty answer with zero usable ids is a shape change or a decoy
+                # envelope, not an authoritative empty — treat it as a failed fetch so a
+                # good cache survives (mirrors the catalog's zero-usable-ids guard). A
+                # truly empty upstream list stays authoritative below.
+                raise ValueError("classic model list returned no usable ids")
+            fetched_ids = valid
     except Exception as exc:
         logger.debug("Classic model list fetch failed: %s", exc)
     if fetched_ids is not None:
@@ -703,12 +777,12 @@ def _classic_models() -> List[str]:
                 # START token, not completion time (see _catalog): later-started wins.
                 _CLASSIC_CACHE["last_success"] = started
         return list(fetched_ids)
-    if cached:
-        return list(cached)
+    # Remember the failure whether or not a stale cache exists (mirrors _catalog): a down
+    # endpoint must cost one timeout per window, not one per call.
     with _CLASSIC_LOCK:
         if started >= float(_CLASSIC_CACHE.get("last_success") or 0.0):
             _CLASSIC_CACHE["negative_until"] = time.time() + NEGATIVE_TTL
-    return []
+    return list(cached) if cached else []
 
 
 def _classic_set() -> set:
@@ -735,6 +809,105 @@ def _free_route_unavailable() -> bool:
     """
     with _CLASSIC_LOCK:
         return time.time() < float(_CLASSIC_CACHE.get("negative_until") or 0.0)
+
+
+def _spec_cache_path() -> Path:
+    return _hermes_home() / "cache" / "pollinations_spec_limits.json"
+
+
+_SPEC_CACHE: Dict[str, Any] = {"negative_until": 0.0, "last_success": 0.0}
+_SPEC_LOCK = threading.Lock()
+
+
+def _is_int(value: Any) -> TypeGuard[int]:
+    """A plain int (bool excluded — True is not a limit)."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _validated_limits(limits: Dict[str, Any]) -> Dict[str, Optional[int]]:
+    """Shape- and sanity-check the three limits; anything unusable reads as unknown."""
+    prompt = limits.get("edit_prompt_max")
+    lo, hi = limits.get("seed_min"), limits.get("seed_max")
+    lo = lo if _is_int(lo) else None
+    hi = hi if _is_int(hi) else None
+    if lo is not None and hi is not None and lo > hi:
+        lo = hi = None  # an inconsistent range is not a limit
+    return {"edit_prompt_max": prompt if _is_int(prompt) and prompt > 0 else None,
+            "seed_min": lo, "seed_max": hi}
+
+
+def _spec_limits_from(payload: Any) -> Dict[str, Optional[int]]:
+    """The edit prompt maxLength and the seed range from an OpenAPI document.
+
+    Every read is shape-guarded: the spec is third-party JSON, so a renamed or malformed
+    field degrades to "unknown" rather than raising. Unknown limits mean the plugin skips
+    its client-side pre-checks and lets the server enforce its own contract.
+    """
+    out: Dict[str, Any] = {}
+    doc = _as_dict(payload)
+    paths = _as_dict(doc.get("paths"))
+    get = _as_dict(_as_dict(paths.get("/image/{prompt}")).get("get"))
+    for param in _as_list(get.get("parameters")):
+        if isinstance(param, dict) and param.get("name") == "seed":
+            schema = _as_dict(param.get("schema"))
+            out["seed_min"], out["seed_max"] = schema.get("minimum"), schema.get("maximum")
+    post = _as_dict(_as_dict(paths.get("/v1/images/edits")).get("post"))
+    content = _as_dict(_as_dict(post.get("requestBody")).get("content"))
+    schema = _as_dict(_as_dict(content.get("application/json")).get("schema"))
+    ref = schema.get("$ref")
+    if isinstance(ref, str) and ref.startswith("#/components/schemas/"):
+        schemas = _as_dict(_as_dict(doc.get("components")).get("schemas"))
+        schema = _as_dict(schemas.get(ref.rsplit("/", 1)[-1]))
+    out["edit_prompt_max"] = _as_dict(_as_dict(schema.get("properties")).get("prompt")).get("maxLength")
+    return _validated_limits(out)
+
+
+def _spec_limits() -> Dict[str, Optional[int]]:
+    """Live API limits from the published spec: fresh fetch, else fresh-enough cache, else
+    stale cache, else all-unknown. Mirrors the catalog's negative-window and start-token
+    guards so a down spec endpoint costs one timeout per window, not one per call."""
+    path = _spec_cache_path()
+    cached: Optional[Dict[str, Optional[int]]] = None
+    try:
+        raw = read_json_or_empty(path)
+        if _cache_schema_ok(raw) and isinstance(raw.get("limits"), dict):
+            candidate = _validated_limits(raw["limits"])
+            # An all-unknown cache is not a usable limit set (a transient placeholder may
+            # have been written by an older version); ignore it and refetch.
+            if any(v is not None for v in candidate.values()):
+                cached = candidate
+                age = time.time() - float(raw.get("fetched") or 0)
+                if 0 <= age < SPEC_TTL:
+                    return cached
+    except Exception:
+        pass
+    with _SPEC_LOCK:
+        if time.time() < float(_SPEC_CACHE.get("negative_until") or 0.0):
+            return cached if cached is not None else _validated_limits({})
+    started = time.time()
+    try:
+        limits = _spec_limits_from(_http_get_json(SPEC_URL))
+        if not any(v is not None for v in limits.values()):
+            # A parseable document carrying none of the limits is not the contract we know
+            # (a rename, placeholder or error envelope): treat it as a failed fetch so a good
+            # cache survives and the next window retries, rather than caching "unknown".
+            raise ValueError("Pollinations spec published no usable limits")
+        with _SPEC_LOCK:
+            if started >= float(_SPEC_CACHE.get("last_success") or 0.0):
+                try:
+                    atomic_json_write(path, {"version": CACHE_SCHEMA, "fetched": time.time(),
+                                             "limits": limits})
+                except Exception as exc:
+                    logger.debug("Could not cache Pollinations spec limits: %s", exc)
+                _SPEC_CACHE["negative_until"] = 0.0
+                _SPEC_CACHE["last_success"] = started
+        return limits
+    except Exception as exc:
+        logger.debug("Pollinations spec fetch failed: %s", exc)
+        with _SPEC_LOCK:
+            if started >= float(_SPEC_CACHE.get("last_success") or 0.0):
+                _SPEC_CACHE["negative_until"] = time.time() + NEGATIVE_TTL
+        return cached if cached is not None else _validated_limits({})
 
 
 def _as_dict(value: Any) -> Dict[str, Any]:
@@ -929,8 +1102,8 @@ def _edit_path(entry: Optional[Dict[str, Any]]) -> Optional[str]:
 
 
 def _supports_edits(entry: Optional[Dict[str, Any]]) -> bool:
-    """True when the catalog advertises an edits endpoint for this model."""
-    return _edit_path(entry) is not None
+    """True when the catalog advertises an edits endpoint AND accepts at least one reference."""
+    return _edit_path(entry) is not None and _reference_cap(entry) > 0
 
 
 def _edit_url(entry: Optional[Dict[str, Any]]) -> str:
@@ -970,17 +1143,23 @@ def _edit_url(entry: Optional[Dict[str, Any]]) -> str:
 def _reference_cap(entry: Optional[Dict[str, Any]]) -> int:
     """The catalog's published reference-image cap, ceilinged; a conservative default otherwise.
 
-    Published caps range 1-16. Models that publish none (mostly community endpoints) get a
-    conservative default rather than the ceiling: such endpoints commonly accept a single
-    image, and over-sending would 400. An explicit cap is always honored up to the ceiling.
+    Published caps observed to date range 1-16. Models that publish none (mostly community
+    endpoints) get a conservative default rather than the ceiling: such endpoints commonly
+    accept a single image, and over-sending would 400. An explicit cap is honored up to the
+    ceiling; a published 0 means no reference images and disables edits for the entry.
     """
     raw = (entry or {}).get("max_reference_images")
     if raw is None or raw == "" or isinstance(raw, bool):
         return DEFAULT_REFERENCE_CAP
     try:
-        return max(1, min(int(raw), MAX_REFERENCE_IMAGES))
+        cap = int(raw)
     except Exception:
         return DEFAULT_REFERENCE_CAP
+    if cap <= 0:
+        # A published zero (or nonsense negative) means the model accepts no reference
+        # images; honor it by disabling edits for the entry rather than clamping to 1.
+        return 0
+    return min(cap, MAX_REFERENCE_IMAGES)
 
 
 def _published_resolutions(entry: Optional[Dict[str, Any]]) -> set:
@@ -1176,9 +1355,14 @@ def _iso_date(model: Dict[str, Any]) -> str:
     else:
         seconds /= 1000.0
     try:
-        return time.strftime("%Y-%m-%d", time.gmtime(seconds))
+        tm = time.gmtime(seconds)
     except (OverflowError, OSError, ValueError):
         return ""
+    # A hostile or mistaken epoch must not render an absurd year in the picker; degrade to
+    # blank like every other display field.
+    if not 1970 <= tm.tm_year <= 2100:
+        return ""
+    return time.strftime("%Y-%m-%d", tm)
 
 
 def _index(catalog: List[Dict[str, Any]]) -> Dict[str, str]:
@@ -1310,9 +1494,10 @@ def _image_is_complete(raw: bytes, sniffed: Optional[str]) -> bool:
     """True when the payload carries its format's end marker, not just its magic bytes.
 
     A truncated download keeps its header, so a magic-byte check alone would report success on a
-    file a viewer cannot open. These are cheap structural pre-filters, not a decode: a crafted
-    tail can still fool the JPEG/GIF markers, so the markers are anchored where the format allows
-    (PNG's IEND is a fixed final chunk; WebP needs a real first chunk).
+    file a viewer cannot open. These are cheap structural pre-filters, not a decode or an
+    integrity check: every marker here (JPEG EOI, GIF trailer, PNG IEND suffix, WebP first
+    chunk) can be spoofed by a crafted payload with no decodable image data. They catch
+    truncation, not malice.
     """
     if not raw:
         return False
@@ -1786,6 +1971,10 @@ class PollinationsImageGenProvider(ImageGenProvider):
         except Exception as exc:
             return _request_failed(exc, action="image generation",
                                    mode=str(extra.get("mode") or "quest"), fail=fail)
+        if produced is None:
+            # No announced size (the classic route never sends one): measure a JPEG from its
+            # SOF marker so a server-side clamp is reported honestly.
+            produced = _jpeg_dimensions(data)
         if produced is not None:
             # The API announced the produced size (it can clamp oversized requests); report it
             # instead of the requested one, keeping the request alongside for transparency.
@@ -1843,10 +2032,11 @@ class PollinationsImageGenProvider(ImageGenProvider):
             hint = f" Edit-capable models: {', '.join(options)}." if options else ""
             return fail(f"Model '{model}' cannot edit images.{hint}", "unsupported")
 
-        if len(prompt) > EDIT_PROMPT_LIMIT:
+        prompt_max = _spec_limits()["edit_prompt_max"]
+        if prompt_max is not None and len(prompt) > prompt_max:
             return fail(
                 f"The edit prompt is {len(prompt)} characters; the API accepts at most "
-                f"{EDIT_PROMPT_LIMIT}. Shorten it and try again.", "invalid_input")
+                f"{prompt_max}. Shorten it and try again.", "invalid_input")
         # Hermes caps the reference count in its schema, but a direct call could over-send.
         cap = _reference_cap(entry)
         dropped = max(0, len(sources) - cap)
@@ -1913,8 +2103,16 @@ class PollinationsImageGenProvider(ImageGenProvider):
         # A 200 can still carry an error object; surfacing it beats "no image data".
         upstream_error = answered.get("error")
         if upstream_error:
-            message = upstream_error.get("message") if isinstance(upstream_error, dict) else None
-            detail = _text(message) or "Pollinations reported an error"
+            if isinstance(upstream_error, dict):
+                message = upstream_error.get("message")
+            elif isinstance(upstream_error, str):
+                message = upstream_error
+            else:
+                message = None
+            # Same redaction as the HTTP-error path: a signed URL echoed in a 200 error
+            # message must never reach the agent-visible preview.
+            detail = (_text(_URL_RE.sub("[url]", message))
+                      if isinstance(message, str) else "") or "Pollinations reported an error"
             return fail(f"Pollinations could not edit the image: {detail}", "api_error")
         data = answered.get("data")
         if not isinstance(data, list) or not data:

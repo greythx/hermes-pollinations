@@ -265,6 +265,31 @@ def test_signed_url_inside_error_message_redacted():
     assert "fetch failed" in preview, preview
 
 
+class _RawBodyResponse:
+    headers = {}
+
+    def __init__(self, body: bytes):
+        self._body = body
+
+    def iter_bytes(self):
+        yield self._body
+
+
+def test_double_escaped_urls_redacted():
+    mod = _require()
+    dbl = b"\\\\"  # two literal backslashes
+    bodies = [
+        b"not json https:" + dbl + b"/" + dbl + b"/cdn.example/img?sig=DOUBLE tail",
+        b"not json https:" + dbl + b"u002f" + dbl + b"u002fcdn.example/img?sig=UNI tail",
+        b"not json https:" + dbl + b"/" + b"\\/" + b"cdn.example/img?sig=MIXED tail",
+    ]
+    for body in bodies:
+        _, preview = mod._error_fields(_RawBodyResponse(body))
+        assert "[url]" in preview, preview
+        for secret in ("DOUBLE", "UNI", "MIXED"):
+            assert secret not in preview, preview
+
+
 def _main() -> int:
     tests = [(name, fn) for name, fn in sorted(globals().items())
              if name.startswith("test_") and callable(fn)]

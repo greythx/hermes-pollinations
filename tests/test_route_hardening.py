@@ -64,7 +64,8 @@ _ORIG: dict = {}
 
 def _route_setup(mod, *, catalog, classic, key="sk_dummy"):
     for name in ("_api_key", "load_image_gen_config", "_catalog", "_classic_models",
-                 "_include_paid_models", "_http_get_bytes", "_http_get_image", "save_b64_image"):
+                 "_include_paid_models", "_http_get_bytes", "_http_get_image", "save_b64_image",
+                 "_spec_limits"):
         _ORIG.setdefault(name, getattr(mod, name, None))
         if _ORIG[name] is not None:
             setattr(mod, name, _ORIG[name])
@@ -73,6 +74,8 @@ def _route_setup(mod, *, catalog, classic, key="sk_dummy"):
     setattr(mod, "_catalog", lambda: catalog)
     setattr(mod, "_classic_models", lambda: classic)
     setattr(mod, "_include_paid_models", lambda pid: False)
+    setattr(mod, "_spec_limits",
+            lambda: {"edit_prompt_max": 32000, "seed_min": -1, "seed_max": 2147483647})
     setattr(mod, "save_b64_image",
             lambda b64, *, prefix="image", extension="png": f"/tmp/{prefix}_test.{extension}")
     captured = {}
@@ -152,7 +155,7 @@ def test_t2i_invalid_seed_falls_back_to_random():
 
     setattr(mod, "random", _SeqRandom())
     try:
-        for n, bad in enumerate((True, -1, 2**31, "42"), start=1):
+        for n, bad in enumerate((True, 2**31, "42"), start=1):
             captured.clear()
             res = mod.PollinationsImageGenProvider().generate(
                 "a cat", model="test/quest-model", seed=bad)
