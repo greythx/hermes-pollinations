@@ -343,6 +343,13 @@ def _read_prefix(response: Any, limit: int) -> bytes:
     return b"".join(chunks)
 
 
+# URLs in raw error text can be JSON-escaped (https:\/\/ or https:\/), so the
+# redaction matches every escaped form of the two slashes, and stops at whitespace or a quote
+# so a compact JSON body does not redact past the string it is in.
+_URL_SLASH = r"(?:\\?/|\\u002[fF])"
+_URL_RE = re.compile(r"https?:" + _URL_SLASH + r"{2}[^\s\"']*", re.IGNORECASE)
+
+
 def _error_fields(response: Any) -> tuple[Optional[str], str]:
     """The upstream error code and a short, control-character-free preview, safe for the agent.
 
@@ -372,7 +379,10 @@ def _error_fields(response: Any) -> tuple[Optional[str], str]:
         elif isinstance(err, str):
             message = err
     if message is None:
-        message = re.sub(r"https?://\S+", "[url]", raw)
+        message = raw
+    # Redact on EVERY path (extracted message included): a signed URL must never reach the
+    # agent-visible preview, in plain or JSON-escaped form, before the 200-character cut.
+    message = _URL_RE.sub("[url]", message)
     preview = "".join(ch for ch in message if ch.isprintable() or ch in " \t").strip()[:200]
     return code, preview
 

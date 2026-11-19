@@ -225,6 +225,46 @@ def test_oversize_non_json_error_body_redacts_urls():
     assert len(preview) <= 200, len(preview)
 
 
+def test_escaped_signed_url_redacted_in_truncated_body():
+    mod = _require()
+    # A JSON body longer than the 64KiB prefix: truncation breaks json.loads, so the raw-text
+    # fallback must still redact JSON-escaped slashes (https:\/\/). The URL sits INSIDE the
+    # prefix so the fallback actually sees it.
+    body = ('{"url": "https:\\/\\/cdn.example\\/img?sig=SUPERSECRET", '
+            '"error": {"message": "' + "x" * 70000 + '"}}').encode()
+    code, preview = mod._error_fields(_FakeResponse(body))
+    assert "SUPERSECRET" not in preview, preview
+    assert "cdn.example" not in preview, preview
+
+
+def test_escaped_signed_url_redacted_in_short_invalid_body():
+    mod = _require()
+    body = b"not json at all https:\\/\\/cdn.example\\/img?sig=SUPERSECRET tail"
+    code, preview = mod._error_fields(_FakeResponse(body))
+    assert "SUPERSECRET" not in preview, preview
+    assert "cdn.example" not in preview, preview
+
+
+def test_escaped_url_redacted_in_valid_json_without_message():
+    mod = _require()
+    # Parses fine but carries no error.message: the fallback sees the RAW text, where the
+    # slashes are still escaped (plain and \\u002f forms).
+    body = b'{"url": "https:\\/\\/cdn.example\\/img?sig=SUPERSECRET", "code": 400}'
+    code, preview = mod._error_fields(_FakeResponse(body))
+    assert "SUPERSECRET" not in preview, preview
+    body = b'{"url": "https:\\u002f\\u002fcdn.example\\/img?sig=SUPERSECRET"}'
+    code, preview = mod._error_fields(_FakeResponse(body))
+    assert "SUPERSECRET" not in preview, preview
+
+
+def test_signed_url_inside_error_message_redacted():
+    mod = _require()
+    body = json.dumps({"error": {"message": "fetch failed https://cdn.example/img?sig=SUPERSECRET"}}).encode()
+    code, preview = mod._error_fields(_FakeResponse(body))
+    assert "SUPERSECRET" not in preview, preview
+    assert "fetch failed" in preview, preview
+
+
 def _main() -> int:
     tests = [(name, fn) for name, fn in sorted(globals().items())
              if name.startswith("test_") and callable(fn)]
