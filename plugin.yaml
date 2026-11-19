@@ -1,5 +1,5 @@
 name: pollinations
-version: 1.4.4
+version: 1.4.5
 description: "Pollinations image generation and editing. The picker is read live from the Pollinations catalog, so it follows changes without a plugin update. No key is needed for the free route; a Pollinations key unlocks the rest of the catalog and editing; paid-only models sit behind a toggle that ships off."
 author: greythx
 kind: backend
