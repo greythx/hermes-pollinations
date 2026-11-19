@@ -58,7 +58,7 @@ import re
 import threading
 import time
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable, Dict, List, NamedTuple, Optional
 from urllib.parse import quote, urlsplit, urlunsplit
@@ -658,8 +658,16 @@ def _as_number(value: Any) -> Optional[float]:
     if not isinstance(value, (int, float, str)):
         return None
     try:
-        number = float(value)
-    except (TypeError, ValueError, OverflowError):
+        if isinstance(value, str):
+            dec = Decimal(value)
+            number = float(dec)
+            # float() silently underflows a tiny nonzero rate to zero; that is not
+            # a free price, and negative zero would also dodge the sign check.
+            if dec != 0 and number == 0:
+                return None
+        else:
+            number = float(value)
+    except (InvalidOperation, OverflowError, TypeError, ValueError):
         return None
     return number if math.isfinite(number) else None
 
@@ -837,7 +845,11 @@ def _format_price(value: Any) -> str:
         return "Free"
     # Decimal expands the float's shortest repr without scientific notation and
     # without rounding a tiny positive rate to "0 pollen" at a fixed precision.
-    formatted = format(Decimal(str(amount)), "f").rstrip("0").rstrip(".")
+    # Trim zeros only from a fractional part: an integer like 1e20 has none, and
+    # stripping its trailing zeros would render 100000000000000000000 as "1".
+    formatted = format(Decimal(str(amount)), "f")
+    if "." in formatted:
+        formatted = formatted.rstrip("0").rstrip(".")
     # An absurd amount would otherwise render as a hundreds-of-digits label.
     return (formatted[:24] + "…" if len(formatted) > 24 else formatted) + " pollen"
 

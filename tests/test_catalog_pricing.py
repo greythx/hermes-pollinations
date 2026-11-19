@@ -154,6 +154,24 @@ def test_negative_string_price_is_unpublished():
     assert label == "No published price · needs key", label
 
 
+def test_underflowed_string_price_is_not_free():
+    mod = _require()
+    # float("1e-400") underflows to 0.0 without raising; that is not a free price.
+    for raw in ("1e-400", "-1e-400"):
+        assert mod._format_price(raw) == "No published price", repr(raw)
+        assert mod._advertises_free(_model(raw)) is False, repr(raw)
+    label = mod._price_label(_model("1e-400", flat_rate=True), False, True)
+    assert label == "No published price · needs key", label
+    assert mod._format_price("0e5") == "Free"  # a real zero stays free
+
+
+def test_large_prices_keep_integer_zeros():
+    mod = _require()
+    assert mod._format_price(1e20) == "1" + "0" * 20 + " pollen"
+    assert mod._format_price("1e20") == "1" + "0" * 20 + " pollen"
+    assert mod._format_price(1e30) == "1" + "0" * 23 + "… pollen"
+
+
 def _main() -> int:
     tests = [(name, fn) for name, fn in sorted(globals().items())
              if name.startswith("test_") and callable(fn)]
