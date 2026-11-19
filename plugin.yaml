@@ -1,6 +1,6 @@
 name: pollinations
-version: 1.4.5
-description: "Pollinations image generation and editing. The picker is read live from the Pollinations catalog, so it follows changes without a plugin update. No key is needed for the free route; a Pollinations key unlocks the rest of the catalog and editing; paid-only models sit behind a toggle that ships off."
+version: 1.5.0
+description: "Pollinations image generation and editing. The picker is read live from the Pollinations catalog, so it follows changes without a plugin update. No key is needed for the free route; a Pollinations key unlocks the rest of the catalog and editing; paid-only models sit behind a toggle that ships off and gates both the picker and invocation."
 author: greythx
 kind: backend
 license: MIT
@@ -20,4 +20,4 @@ config_schema:
     type: bool
     default: false
     label: "Include paid models"
-    description: "Also list paid-only Pollinations models in the picker. Requires a Pollinations API key with a paid balance; free and unpaid-credit models are listed either way."
+    description: "Also list and allow paid-only Pollinations models. Off by default: paid-only models are hidden from the picker and refused at generation time. Requires a Pollinations API key with a paid balance; free and unpaid-credit models work either way."
