@@ -58,6 +58,7 @@ import re
 import threading
 import time
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable, Dict, List, NamedTuple, Optional
 from urllib.parse import quote, urlsplit, urlunsplit
@@ -633,6 +634,44 @@ def _is_number(value: Any) -> bool:
         return False  # an int too large for a float
 
 
+# A published rate is a plain ASCII decimal, optionally signed, with an optional
+# exponent. float() alone is too lenient for third-party data: it reads "1_000"
+# and non-ASCII digits as amounts, so the shape is gated before conversion.
+_PRICE_SHAPE = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", re.ASCII)
+
+
+def _as_number(value: Any) -> Optional[float]:
+    """A catalog price as a finite float, or None when it is not an amount.
+
+    The catalog's OpenAPI contract types every ``pricing`` rate as a string
+    (``"0.002"``); older snapshots sent numbers. Both must read as the same
+    amount. ``bool`` is excluded explicitly — ``false`` is not a zero price and
+    ``true`` is not one pollen — as are NaN/Infinity and strings that are not
+    plain decimal numbers.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        value = value.strip()
+        if not _PRICE_SHAPE.fullmatch(value):
+            return None
+    if not isinstance(value, (int, float, str)):
+        return None
+    try:
+        if isinstance(value, str):
+            dec = Decimal(value)
+            number = float(dec)
+            # float() silently underflows a tiny nonzero rate to zero; that is not
+            # a free price, and negative zero would also dodge the sign check.
+            if dec != 0 and number == 0:
+                return None
+        else:
+            number = float(value)
+    except (InvalidOperation, OverflowError, TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
 def _text(value: Any) -> str:
     """A catalog string field as printable text; anything else reads as empty.
 
@@ -793,25 +832,24 @@ def _classic_id_for(model: str, catalog: List[Dict[str, Any]]) -> Optional[str]:
 
 def _price_value(model: Dict[str, Any]) -> float:
     """Numeric pollen price for ordering; unpublished prices sort as zero (cheapest)."""
-    raw = _as_dict(model.get("pricing")).get("completionImageTokens")
-    if not _is_number(raw):
-        return 0.0
-    amount = float(raw)
-    return amount if amount >= 0 else 0.0
+    amount = _as_number(_as_dict(model.get("pricing")).get("completionImageTokens"))
+    return amount if amount is not None and amount >= 0 else 0.0
 
 
 def _format_price(value: Any) -> str:
     """Plain-decimal pollen amount; never scientific notation."""
-    # ``bool`` is a subclass of ``int``, so it is excluded explicitly: a catalog that publishes
-    # ``true`` as a price is not charging one pollen.
-    if isinstance(value, bool) or not _is_number(value):
-        return "No published price"
-    amount = float(value)
-    if amount < 0:
+    amount = _as_number(value)
+    if amount is None or amount < 0:
         return "No published price"
     if amount == 0:
         return "Free"
-    formatted = f"{amount:.12f}".rstrip("0").rstrip(".")
+    # Decimal expands the float's shortest repr without scientific notation and
+    # without rounding a tiny positive rate to "0 pollen" at a fixed precision.
+    # Trim zeros only from a fractional part: an integer like 1e20 has none, and
+    # stripping its trailing zeros would render 100000000000000000000 as "1".
+    formatted = format(Decimal(str(amount)), "f")
+    if "." in formatted:
+        formatted = formatted.rstrip("0").rstrip(".")
     # An absurd amount would otherwise render as a hundreds-of-digits label.
     return (formatted[:24] + "…" if len(formatted) > 24 else formatted) + " pollen"
 
@@ -822,12 +860,8 @@ def _advertises_free(model: Dict[str, Any]) -> bool:
     A published price of zero is the stronger signal; the name is only a fallback, because a
     title containing "free" can be marketing copy for a model that is in fact billed.
     """
-    raw = _as_dict(model.get("pricing")).get("completionImageTokens")
-    try:
-        if float(raw) == 0:
-            return True
-    except (TypeError, ValueError, OverflowError):
-        pass
+    if _as_number(_as_dict(model.get("pricing")).get("completionImageTokens")) == 0:
+        return True
     text = f"{model.get('title') or ''} {model.get('name') or ''}"
     return re.search(r"\bfree\b", text, re.IGNORECASE) is not None
 
@@ -849,12 +883,14 @@ def _price_label(model: Dict[str, Any], free_classic: bool, has_key: bool) -> st
     price is per image or per token.
     """
     paid_only = _as_bool(model.get("paid_only"))
-    raw = _as_dict(model.get("pricing")).get("completionImageTokens")
+    amount = _as_number(_as_dict(model.get("pricing")).get("completionImageTokens"))
+    if amount is not None and amount < 0:
+        amount = None  # a negative rate is not a published price, whatever its type
     if free_classic and not has_key:
         if paid_only:
             return "Free on the classic route · watermark · reduced size · no key needed"
         return "Free · watermark · reduced size · no key needed"
-    if not _is_number(raw):
+    if amount is None:
         # A title that says "free" describes the free classic route; once a key is set this model
         # is billed through the enter API, so the label must not imply it is free.
         cost = ("No published price" if has_key
@@ -867,7 +903,7 @@ def _price_label(model: Dict[str, Any], free_classic: bool, has_key: bool) -> st
         elif not _as_bool(model.get("flat_rate")) or unit in ("token", "tokens"):
             cost = "charged per token"
         else:
-            cost = _format_price(raw)
+            cost = _format_price(amount)
     # A model priced per variant (a 2K tier, an edit operation) can cost more than the base
     # figure the picker shows, so mark that the figure is a floor.
     if _as_list(model.get("pricing_variants")) and cost.endswith("pollen"):
