@@ -602,7 +602,12 @@ def _seed_from(kwargs: Dict[str, Any]) -> int:
         if lo is None or hi is None or lo <= raw <= hi:
             return raw
     top = hi if hi is not None else _RANDOM_SEED_MAX
-    return random.randint(0, top)
+    bottom = max(0, lo) if lo is not None else 0
+    if bottom > top:
+        # A negative-only published range cannot host a nonnegative random seed: return the
+        # published upper bound (a valid in-range value) rather than raising out of generate().
+        return top
+    return random.randint(bottom, top)
 
 
 _CATALOG_CACHE: Dict[str, Any] = {"negative_until": 0.0, "last_success": 0.0}

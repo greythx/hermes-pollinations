@@ -308,6 +308,38 @@ def test_polluted_all_unknown_cache_ignored():
     assert mod._spec_limits() == KNOWN
 
 
+def test_random_seed_respects_positive_lower_bound():
+    mod = _require()
+    captured, _ = _setup(mod, fetch=_spec_doc(seed_min=100, seed_max=200))
+    seen = {}
+    orig_random = mod.random
+
+    class _R:
+        def randint(self, a, b):
+            seen["range"] = (a, b)
+            return 150
+
+    setattr(mod, "random", _R())
+    try:
+        res = mod.PollinationsImageGenProvider().generate(
+            "edit", model="test/spec-model", image_url="https://example.com/a.png")
+        assert res["success"] is True, res
+        assert captured["payload"]["seed"] == 150, captured["payload"]
+        assert seen["range"] == (100, 200), seen
+    finally:
+        setattr(mod, "random", orig_random)
+
+
+def test_random_seed_negative_only_range_never_raises():
+    mod = _require()
+    for lo, hi, want in ((-1, -1, -1), (-5, -2, -2)):
+        captured, _ = _setup(mod, fetch=_spec_doc(seed_min=lo, seed_max=hi))
+        res = mod.PollinationsImageGenProvider().generate(
+            "edit", model="test/spec-model", image_url="https://example.com/a.png")
+        assert res["success"] is True, res
+        assert captured["payload"]["seed"] == want, (lo, hi, captured["payload"])
+
+
 def _main() -> int:
     tests = [(name, fn) for name, fn in sorted(globals().items())
              if name.startswith("test_") and callable(fn)]
