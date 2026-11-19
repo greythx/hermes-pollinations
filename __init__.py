@@ -35,8 +35,11 @@ the day it appears.
 Picker visibility follows the credentials, so the list never offers a model the current setup
 cannot run: no key → the models the free classic API serves (usually one); a key → every
 Quest-eligible model; a key plus the ``include_paid_models`` setting (Desktop → Settings →
-Plugins) → the paid-only catalog too. The user's saved model is always kept visible, so
-neither change makes it vanish.
+Plugins) → the paid-only catalog too. The setting also gates invocation: a paid-only catalog
+model is refused while it is off, whichever path selected it. The user's saved model is always
+kept visible, so neither change makes it vanish. Rows are ordered by estimated per-image cost:
+per-image and per-megapixel rates are normalized, per-token models follow them, and unpublished
+prices sort last.
 
 Picker labels carry the access requirement, watermark and edit support, none of which the
 catalog publishes: the price column reads ``Free · watermark · reduced size · no key needed``
@@ -60,7 +63,7 @@ import time
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Callable, Dict, List, NamedTuple, Optional
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, TypeGuard
 from urllib.parse import quote, urlsplit, urlunsplit
 
 from agent.image_gen_provider import (
@@ -73,7 +76,7 @@ from agent.image_gen_provider import (
 )
 from plugins.image_gen._common import (
     api_key_setup_schema, cache_url_best_effort, catalog_rows, collect_source_images,
-    error_factory, load_image_gen_config)
+    error_factory, load_image_gen_config, record_token_usage)
 from utils import atomic_json_write, read_json_or_empty
 
 logger = logging.getLogger(__name__)
@@ -93,8 +96,8 @@ ENTER_HOST = "gen.pollinations.ai"
 API_KEY_ENVS = ("POLLINATIONS_API_KEY",)
 MODEL_ENV = "POLLINATIONS_IMAGE_MODEL"
 PROVIDER_ID = "pollinations"
-# Fallback registry id, used when register() is handed a context without ``plugin_id`` (the
-# admission validator's probe stub). The live value comes from ``ctx.plugin_id``.
+# Fallback registry id for a context without ``plugin_id`` (e.g. a hand-rolled stub); the
+# admission validator's probe supplies its own plugin_id. The live value comes from ``ctx.plugin_id``.
 PLUGIN_ID = "image_gen/pollinations"
 INCLUDE_PAID_KEY = "include_paid_models"
 CATALOG_TTL = 3600
@@ -109,10 +112,16 @@ RESOLUTION_VOCAB = frozenset({"1k", "2k"})
 # The reference cap comes from the untrusted catalog, so it is ceilinged here; the bundled edit
 # plugin uses the same bound.
 MAX_REFERENCE_IMAGES = 16
+# Default reference cap for edit models that publish none: conservative, because community
+# endpoints commonly accept a single image. Published caps (1-16) are always honored.
+DEFAULT_REFERENCE_CAP = 4
+# The edits API's published prompt limit (OpenAPI maxLength on the edits requestBody).
+EDIT_PROMPT_LIMIT = 32000
 # Every response body is bounded before it is buffered, decoded or written to the cache.
 MAX_RESPONSE_BYTES = 25 * 1024 * 1024
-# Total inlined reference images for one edit. Each is base64 in a JSON body, so the cap keeps a
-# 16-reference request inside a size the enter API will accept rather than failing server-side.
+# Total inlined reference images for one edit, plus the prompt and JSON framing. A conservative
+# client guard (the spec publishes no body-size limit); oversize requests are rejected here
+# before the base64 blow-up rather than failing server-side.
 MAX_EDIT_PAYLOAD_BYTES = 40 * 1024 * 1024
 # How long a failed free-model lookup is remembered, so a down endpoint is not retried per call.
 NEGATIVE_TTL = 60.0
@@ -126,13 +135,17 @@ EDIT_HINT_MODELS = 3
 # trusted, so a shape change upstream cannot silently mislabel rows.
 CACHE_SCHEMA = 1
 
-# Semantic aspect -> pixel size; every Pollinations image model accepts these. The free
-# classic route keeps the aspect ratio within its own smaller area cap.
+# Semantic aspect -> pixel size; satisfies every per-model size constraint the spec currently
+# publishes. The free classic route keeps the aspect ratio within its own smaller area cap.
 SIZES: Dict[str, tuple[int, int]] = {
     "landscape": (1280, 768),
     "square": (1024, 1024),
     "portrait": (768, 1280),
 }
+
+# Typical output area in megapixels, derived from the plugin's own sizes — used only to estimate
+# a per-image cost for models the catalog bills per megapixel. Not a Pollinations fact.
+_TYPICAL_MP = sum(w * h for w, h in SIZES.values()) / len(SIZES) / 1_000_000
 
 # Picker/spec fields, all live from the catalog. Fields Pollinations leaves unpublished for
 # most models (resolutions, max_reference_images, capabilities, brand_url, pricing_dimensions)
@@ -141,8 +154,8 @@ SIZES: Dict[str, tuple[int, int]] = {
 # required_safety the strengths line, max_reference_images the edit cap.
 MODEL_FIELDS = (
     "display", "speed", "strengths", "price", "publisher", "community", "description",
-    "aliases", "price_pollen", "rpm", "modalities", "endpoints", "health", "added",
-    "flat_rate", "free_classic",
+    "aliases", "price_pollen", "price_class", "rpm", "modalities", "endpoints", "health",
+    "added", "flat_rate", "free_classic",
 )
 
 
@@ -236,9 +249,20 @@ def _unwrap_list(payload: Any, keys: tuple) -> Optional[List[Any]]:
                 inner = _unwrap_list(value, keys)
                 if inner is not None:
                     return inner
-        for value in payload.values():
-            if isinstance(value, list):
+        # Positional fallback for a renamed envelope: skip well-known non-model lists and prefer
+        # the first model-shaped list, so an "errors" array cannot pose as the catalog.
+        fallback: Optional[List[Any]] = None
+        for key, value in payload.items():
+            if key in ("errors", "warnings", "messages") or not isinstance(value, list):
+                continue
+            if fallback is None:
+                fallback = value
+            if any(isinstance(item, dict)
+                   and (_valid_id(item.get("name")) or _valid_id(item.get("id")))
+                   for item in value):
                 return value
+        if fallback is not None:
+            return fallback
     return None
 
 
@@ -267,12 +291,14 @@ class _HTTPError(Exception):
     """An upstream HTTP response the plugin could not use, with a safe preview of its body."""
 
     def __init__(self, url: str, status: int, body: str = "",
-                 retry_after: Optional[int] = None) -> None:
+                 retry_after: Optional[int] = None,
+                 error_code: Optional[str] = None) -> None:
         super().__init__(f"HTTP {status} from {url}")
         self.url = url
         self.status = status
         self.body = body
         self.retry_after = retry_after
+        self.error_code = error_code
 
 
 def _retry_after(response: Any) -> Optional[int]:
@@ -291,25 +317,38 @@ def _retry_after(response: Any) -> Optional[int]:
         return None
 
 
-def _body_preview(response: Any) -> str:
-    """A short, control-character-free preview of an error body, safe to show the agent.
+def _error_fields(response: Any) -> tuple[Optional[str], str]:
+    """The upstream error code and a short, control-character-free preview, safe for the agent.
 
-    Raw upstream text is never echoed: a JSON error body is reduced to its ``error.message``
-    and everything else has its control characters stripped.
+    The FULL bounded body is parsed before any truncation: cutting first would break json.loads
+    on a long body and leak sibling fields (such as signed URLs) through the raw-text fallback.
+    A JSON error body is reduced to its ``error.message``; anything else has its URLs redacted.
     """
-    raw = _bounded_read(response, "error response", limit=64 * 1024)[:500].decode("utf-8", "replace")
-    payload: Any = None
+    raw_bytes = _bounded_read(response, "error response", limit=64 * 1024)
+    if _sniff_image_mime(raw_bytes) is not None:
+        # An error status can carry an image body (the classic route does this when unhealthy);
+        # never echo binary garbage into the agent-visible preview.
+        return None, "(non-text error body)"
+    raw = raw_bytes.decode("utf-8", "replace")
+    code: Optional[str] = None
+    message: Optional[str] = None
     try:
         payload = json.loads(raw)
     except Exception:
         payload = None
     if isinstance(payload, dict):
         err = payload.get("error")
-        if isinstance(err, dict) and isinstance(err.get("message"), str):
-            raw = err["message"]
+        if isinstance(err, dict):
+            if isinstance(err.get("code"), str):
+                code = err["code"]
+            if isinstance(err.get("message"), str):
+                message = err["message"]
         elif isinstance(err, str):
-            raw = err
-    return "".join(ch for ch in raw if ch.isprintable() or ch in " \t").strip()[:200]
+            message = err
+    if message is None:
+        message = re.sub(r"https?://\S+", "[url]", raw)
+    preview = "".join(ch for ch in message if ch.isprintable() or ch in " \t").strip()[:200]
+    return code, preview
 
 
 def _network_error_type(exc: Exception) -> str:
@@ -333,10 +372,11 @@ def _request_failed(exc: Exception, *, action: str, mode: str = "quest",
     if isinstance(exc, _HTTPError):
         logger.debug("Pollinations %s (%s): HTTP %s", action, mode, exc.status, exc_info=True)
         wait = f", retry in ~{exc.retry_after}s" if exc.retry_after else ""
-        # The upstream body is already reduced to a short, control-character-free preview, so it is
-        # safe to show. A 402 on this API is not always an empty balance and a 402/429 is not always
-        # a rate limit — guessing between the two sent a user with an invalid model to check their
-        # Pollen balance. The status is named, then the reason Pollinations gave.
+        # The upstream body is already reduced to a short, control-character-free preview, so it
+        # is safe to show. Status semantics differ per route: on the free route 402/429 is the
+        # per-IP throttle; keyed, 402 is a balance/payment condition (waiting cannot fix a
+        # Paid-Pollen restriction) and 429 alone is the rate limit. The free-route wording must
+        # say "rate-limited": the core's guardrail classifier reads the error TEXT, not error_type.
         detail = f": {exc.body}" if exc.body else ""
         if exc.status == 401:
             if mode == "free":
@@ -344,19 +384,41 @@ def _request_failed(exc: Exception, *, action: str, mode: str = "quest",
                     "Pollinations rejected the anonymous free request (401) — the free classic "
                     "route may now require a key. Add POLLINATIONS_API_KEY, or pick a model the "
                     "free API serves.", "auth_required")
+            if (_api_key() or "").lower().startswith("pk_"):
+                return fail(
+                    f"Pollinations rejected the key (401){detail}. pk_ app keys only identify an "
+                    "app and no longer authenticate requests (since 2026-11-01). Use a secret "
+                    "sk_ key from https://enter.pollinations.ai/keys as POLLINATIONS_API_KEY.",
+                    "auth_required")
             return fail(
                 f"Pollinations rejected the API key (401){detail}. Check POLLINATIONS_API_KEY.",
                 "auth_required")
-        if exc.status in (402, 429):
+        if exc.status == 402:
             if mode == "free":
                 return fail(
-                    f"Pollinations returned HTTP {exc.status}{wait}{detail} — the free classic "
-                    "route is throttled per IP. Wait, or add POLLINATIONS_API_KEY to skip the "
-                    "throttle.", "rate_limited")
+                    f"Pollinations returned HTTP 402{wait}{detail} — the free classic route is "
+                    "rate-limited per IP. Wait, or add POLLINATIONS_API_KEY to skip the throttle.",
+                    "rate_limited")
+            if exc.error_code in ("QUEST_POLLEN_ONLY", "QUEST_POLLEN_RESTRICTED"):
+                return fail(
+                    f"Pollinations returned HTTP 402{detail} — this model needs Paid Pollen. "
+                    "Pick a Quest-eligible model, or enable 'Include paid models' with a paid "
+                    "balance at https://enter.pollinations.ai.", "payment_required")
+            balance = "Paid Pollen" if mode == "paid" else "Quest Pollen"
             return fail(
-                f"Pollinations returned HTTP {exc.status}{wait}{detail} — usually the Quest "
-                "Pollen balance or the rate limit. Wait, or check the account at "
-                "https://enter.pollinations.ai.", "rate_limited")
+                f"Pollinations returned HTTP 402{detail} — usually the {balance} balance or the "
+                "key budget is exhausted. Check the account at https://enter.pollinations.ai.",
+                "payment_required")
+        if exc.status == 429:
+            if mode == "free":
+                return fail(
+                    f"Pollinations returned HTTP 429{wait}{detail} — the free classic route is "
+                    "rate-limited per IP. Wait, or add POLLINATIONS_API_KEY to skip the throttle.",
+                    "rate_limited")
+            return fail(
+                f"Pollinations returned HTTP 429{wait}{detail} — rate limit reached. Wait for "
+                "the retry window, or check the account at https://enter.pollinations.ai.",
+                "rate_limited")
         return fail(f"Pollinations returned HTTP {exc.status}{detail}", "api_error")
     logger.debug("Pollinations %s (%s) failed", action, mode, exc_info=True)
     # The raw exception can carry a URL with signed query parameters or a parser's wording, so
@@ -372,8 +434,9 @@ def _http_get_bytes(url: str, *, headers: Optional[Dict[str, str]] = None,
     with _ssrf_client(timeout) as client:
         with client.stream("GET", url, headers=headers or {}) as response:
             if response.status_code >= 400:
-                raise _HTTPError(url, response.status_code, _body_preview(response),
-                                 _retry_after(response))
+                code, preview = _error_fields(response)
+                raise _HTTPError(url, response.status_code, preview,
+                                 _retry_after(response), error_code=code)
             return _bounded_read(response, url)
 
 
@@ -389,8 +452,9 @@ def _http_post_json(url: str, *, headers: Dict[str, str], payload: Dict[str, Any
     with _ssrf_client(timeout, follow_redirects=False) as client:
         with client.stream("POST", url, headers=headers, json=payload) as response:
             if response.status_code >= 400:
-                raise _HTTPError(url, response.status_code, _body_preview(response),
-                                 _retry_after(response))
+                code, preview = _error_fields(response)
+                raise _HTTPError(url, response.status_code, preview,
+                                 _retry_after(response), error_code=code)
             return json.loads(_bounded_read(response, url))
 
 
@@ -398,8 +462,71 @@ def _http_get_json(url: str, timeout: float = 30.0) -> Any:
     return json.loads(_http_get_bytes(url, timeout=timeout))
 
 
+def _parse_image_dimensions(value: Any) -> Optional[tuple[int, int]]:
+    """The ``X-Image-Dimensions`` header as (width, height), or None when absent/malformed."""
+    if not isinstance(value, str):
+        return None
+    match = re.fullmatch(r"\s*(\d{1,5})\s*[xX]\s*(\d{1,5})\s*", value)
+    if not match:
+        return None
+    width, height = int(match.group(1)), int(match.group(2))
+    return (width, height) if width > 0 and height > 0 else None
+
+
+def _http_get_image(url: str, *, headers: Optional[Dict[str, str]] = None,
+                    timeout: float = HTTP_TIMEOUT) -> tuple[bytes, Optional[tuple[int, int]]]:
+    """GET an image through the SSRF guard, reporting the produced size when the API sends it.
+
+    ``X-Image-Dimensions`` is optional and model-specific; when it is absent the caller keeps
+    the requested dimensions (the classic route clamps server-side without announcing it).
+    """
+    with _ssrf_client(timeout) as client:
+        with client.stream("GET", url, headers=headers or {}) as response:
+            if response.status_code >= 400:
+                code, preview = _error_fields(response)
+                raise _HTTPError(url, response.status_code, preview,
+                                 _retry_after(response), error_code=code)
+            dims = _parse_image_dimensions(response.headers.get("x-image-dimensions"))
+            return _bounded_read(response, url), dims
+
+
+def _seed_from(kwargs: Dict[str, Any]) -> int:
+    """A caller-provided seed when it is a valid 32-bit value, else a fresh random one.
+
+    The transport accepts seed, so reproducible generations are possible; a bool is not a seed,
+    and out-of-range or non-integer values fall back to random instead of erroring.
+    """
+    raw = kwargs.get("seed")
+    if isinstance(raw, int) and not isinstance(raw, bool) and 0 <= raw <= SEED_MAX:
+        return raw
+    return random.randint(0, SEED_MAX)
+
+
 _CATALOG_CACHE: Dict[str, Any] = {"negative_until": 0.0, "last_success": 0.0}
 _CATALOG_LOCK = threading.Lock()
+
+
+def _cache_schema_ok(raw: Dict[str, Any]) -> bool:
+    """Strict cache schema gate: an explicit int version equal to CACHE_SCHEMA, nothing else.
+
+    A version-less, boolean or float version is a foreign cache, not ours — ``True == 1`` and
+    ``1.0 == 1`` in Python, so a loose comparison would trust a hand-edited marker.
+    """
+    ver = raw.get("version")
+    return isinstance(ver, int) and not isinstance(ver, bool) and ver == CACHE_SCHEMA
+
+
+def _note_contract_gaps(models: List[Dict[str, Any]]) -> None:
+    """Debug-log when a high-impact contract field is absent across the whole catalog.
+
+    The field names are API contract constants; if Pollinations renames one, every row would
+    silently mislabel (prices vanish, paid models lose their gate, edits disable). A log line
+    makes the rename visible instead of silent.
+    """
+    for field in ("pricing", "paid_only", "supported_endpoints"):
+        if not any(isinstance(m, dict) and field in m for m in models):
+            logger.debug("Pollinations catalog publishes no %r field — possible upstream rename.",
+                         field)
 
 
 def _catalog() -> List[Dict[str, Any]]:
@@ -414,10 +541,12 @@ def _catalog() -> List[Dict[str, Any]]:
         raw = read_json_or_empty(path)
         # A cache written by a different plugin version is ignored rather than trusted.
         models = ([entry for entry in _as_list(raw.get("models")) if isinstance(entry, dict)]
-                  if raw.get("version", CACHE_SCHEMA) == CACHE_SCHEMA else [])
+                  if _cache_schema_ok(raw) else [])
         if models:
             cached = models
-            if time.time() - float(raw.get("fetched") or 0) < CATALOG_TTL:
+            age = time.time() - float(raw.get("fetched") or 0)
+            # A future timestamp (clock skew or a hostile cache) must not read as permanently fresh.
+            if 0 <= age < CATALOG_TTL:
                 return models
     except Exception:
         pass
@@ -437,15 +566,19 @@ def _catalog() -> List[Dict[str, Any]]:
             # An empty answer is not a catalog. Treating it as authoritative would overwrite a
             # good cache and empty the picker, so it is handled as a failed fetch instead.
             raise ValueError("Pollinations catalog returned no models")
-        try:
-            # Atomic replace: a concurrent reader must never see a half-written catalog.
-            atomic_json_write(path, {"version": CACHE_SCHEMA, "fetched": time.time(),
-                                     "models": models})
-        except Exception as exc:
-            logger.debug("Could not cache Pollinations catalog: %s", exc)
+        _note_contract_gaps(models)
         with _CATALOG_LOCK:
-            _CATALOG_CACHE["negative_until"] = 0.0
-            _CATALOG_CACHE["last_success"] = time.time()
+            # Mirror the classic guard on SUCCESS too: a slow stale fetch must not overwrite a
+            # newer cache another thread already wrote.
+            if started >= float(_CATALOG_CACHE.get("last_success") or 0.0):
+                try:
+                    # Atomic replace: a concurrent reader must never see a half-written catalog.
+                    atomic_json_write(path, {"version": CACHE_SCHEMA, "fetched": time.time(),
+                                             "models": models})
+                except Exception as exc:
+                    logger.debug("Could not cache Pollinations catalog: %s", exc)
+                _CATALOG_CACHE["negative_until"] = 0.0
+                _CATALOG_CACHE["last_success"] = time.time()
         return models
     except Exception as exc:
         logger.debug("Pollinations catalog fetch failed: %s", exc)
@@ -471,9 +604,8 @@ def _load_classic_cache() -> Optional[List[str]]:
     """Last free-classic model list we managed to fetch, whatever its age."""
     try:
         raw = read_json_or_empty(_classic_cache_path())
-        ids = ([item.strip() for item in _as_list(raw.get("ids"))
-                if isinstance(item, str) and item.strip()]
-               if raw.get("version", CACHE_SCHEMA) == CACHE_SCHEMA else [])
+        ids = ([item.strip() for item in _as_list(raw.get("ids")) if _valid_id(item)]
+               if _cache_schema_ok(raw) else [])
     except Exception as exc:
         # ``read_json_or_empty`` only guards OSError/ValueError; a pathologically nested or
         # otherwise hostile cache file must degrade to "no cache", not escape to the caller.
@@ -514,9 +646,8 @@ def _classic_models() -> List[str]:
         fetched = _unwrap_list(_http_get_json(CLASSIC_MODELS_URL),
                                ("models", "data", "ids", "items", "results"))
         if fetched is not None:
-            # Only strings can become URL path segments; anything else is discarded.
-            fetched_ids = [item.strip() for item in fetched
-                           if isinstance(item, str) and item.strip()]
+            # Only guarded strings can become URL path segments; anything else is discarded.
+            fetched_ids = [item.strip() for item in fetched if _valid_id(item)]
     except Exception as exc:
         logger.debug("Classic model list fetch failed: %s", exc)
     if fetched_ids is not None:
@@ -594,6 +725,23 @@ def _as_bool(value: Any) -> bool:
     return False
 
 
+# Catalog text fields are display metadata. The strengths column shows 120 characters and no
+# other consumer reads more than a few hundred, so a field longer than this is truncated before
+# the per-character scan — one absurd catalog entry cannot stall the picker.
+TEXT_LIMIT = 4096
+
+
+def _valid_id(value: Any) -> TypeGuard[str]:
+    """True for a string usable as a model id: printable, bounded, surrogate-free.
+
+    Shared by catalog names, classic-endpoint ids and passthrough candidates — each can become
+    a URL path segment, and a lone surrogate raises UnicodeEncodeError out of urllib's quote()
+    while a control character or absurd length builds a hostile URL.
+    """
+    return (isinstance(value, str) and bool(value.strip()) and value.isprintable()
+            and len(value) <= TEXT_LIMIT)
+
+
 def _name_of(model: Dict[str, Any]) -> Optional[str]:
     """The catalog id when it is a usable string, else None.
 
@@ -605,21 +753,12 @@ def _name_of(model: Dict[str, Any]) -> Optional[str]:
         return None
     for field in ("name", "id"):
         value = model.get(field)
-        # A surrogate or control character raises out of urllib's quote() when the id becomes a
-        # URL path segment, and an absurd length would build an absurd URL, so both are dropped.
-        if (isinstance(value, str) and value.strip() and value.isprintable()
-                and len(value) <= TEXT_LIMIT):
+        if _valid_id(value):
             return value.strip()
     return None
 
 
-# Catalog text fields are display metadata. The strengths column shows 120 characters and no
-# other consumer reads more than a few hundred, so a field longer than this is truncated before
-# the per-character scan — one absurd catalog entry cannot stall the picker.
-TEXT_LIMIT = 4096
-
-
-def _is_number(value: Any) -> bool:
+def _is_number(value: Any) -> TypeGuard[float]:
     """True for a finite int/float. JSON ``NaN``/``Infinity`` are floats but never usable here.
 
     ``bool`` is a subclass of ``int``, so without the guard a catalog that publishes
@@ -787,18 +926,19 @@ def _edit_url(entry: Optional[Dict[str, Any]]) -> str:
 
 
 def _reference_cap(entry: Optional[Dict[str, Any]]) -> int:
-    """The catalog's published reference-image cap, ceilinged; the ceiling when it publishes none.
+    """The catalog's published reference-image cap, ceilinged; a conservative default otherwise.
 
-    The edit models that publish a cap say 10-16, and the ones that publish nothing still accept
-    several, so defaulting to 1 would silently discard references the model could have used.
+    Published caps range 1-16. Models that publish none (mostly community endpoints) get a
+    conservative default rather than the ceiling: such endpoints commonly accept a single
+    image, and over-sending would 400. An explicit cap is always honored up to the ceiling.
     """
     raw = (entry or {}).get("max_reference_images")
     if raw is None or raw == "" or isinstance(raw, bool):
-        return MAX_REFERENCE_IMAGES
+        return DEFAULT_REFERENCE_CAP
     try:
         return max(1, min(int(raw), MAX_REFERENCE_IMAGES))
     except Exception:
-        return MAX_REFERENCE_IMAGES
+        return DEFAULT_REFERENCE_CAP
 
 
 def _published_resolutions(entry: Optional[Dict[str, Any]]) -> set:
@@ -830,14 +970,57 @@ def _classic_id_for(model: str, catalog: List[Dict[str, Any]]) -> Optional[str]:
     return None
 
 
-def _price_value(model: Dict[str, Any]) -> float:
-    """Numeric pollen price for ordering; unpublished prices sort as zero (cheapest)."""
+def _pricing_quantity(model: Dict[str, Any]) -> float:
+    """The catalog's ``pricing_units`` quantity for the image rate; 1.0 when unpublished.
+
+    The spec defines the rate per unit as ``pricing[field] × quantity`` (megapixel billing
+    publishes quantity 1e6). Guarded like every catalog number: a bool is not a quantity.
+    """
+    units = _as_dict(_as_dict(model.get("pricing_units")).get("completionImageTokens"))
+    quantity = _as_number(units.get("quantity"))
+    return quantity if quantity is not None and quantity > 0 else 1.0
+
+
+def _price_class(model: Dict[str, Any]) -> int:
+    """Ordering class: 0 = comparable per-image cost, 1 = per-token (or other unconvertible
+    unit), 2 = no published price. Per-token rates cannot be compared to per-image costs
+    without a token count the catalog does not publish, so they sort after class 0; an
+    unpublished price sorts last rather than masquerading as the cheapest."""
     amount = _as_number(_as_dict(model.get("pricing")).get("completionImageTokens"))
-    return amount if amount is not None and amount >= 0 else 0.0
+    if amount is None or amount < 0:
+        return 2
+    if amount == 0:
+        return 0
+    unit = _pricing_unit(model)
+    if unit == "megapixel":
+        return 0
+    if unit in ("", "image", "images", "generation") and _as_bool(model.get("flat_rate")):
+        return 0
+    return 1
 
 
-def _format_price(value: Any) -> str:
-    """Plain-decimal pollen amount; never scientific notation."""
+def _price_value(model: Dict[str, Any]) -> float:
+    """Estimated per-image pollen cost for ordering, within the model's price class.
+
+    Per-image rates scale by ``pricing_units.quantity``; per-megapixel rates additionally
+    scale by the plugin's typical output area. Per-token rates keep their raw figure (only
+    comparable within class 1). Unpublished prices read as zero but sort last via the class.
+    """
+    amount = _as_number(_as_dict(model.get("pricing")).get("completionImageTokens"))
+    if amount is None or amount < 0 or amount == 0:
+        return 0.0
+    unit = _pricing_unit(model)
+    quantity = _pricing_quantity(model)
+    if unit == "megapixel":
+        return amount * quantity * _TYPICAL_MP
+    if unit in ("", "image", "images", "generation") and _as_bool(model.get("flat_rate")):
+        return amount * quantity
+    return amount
+
+
+def _format_price(value: Any, currency: str = "pollen") -> str:
+    """Plain-decimal amount in the catalog's currency; never scientific notation — except when
+    blind truncation would erase every significant digit of a sub-precision rate."""
     amount = _as_number(value)
     if amount is None or amount < 0:
         return "No published price"
@@ -851,7 +1034,14 @@ def _format_price(value: Any) -> str:
     if "." in formatted:
         formatted = formatted.rstrip("0").rstrip(".")
     # An absurd amount would otherwise render as a hundreds-of-digits label.
-    return (formatted[:24] + "…" if len(formatted) > 24 else formatted) + " pollen"
+    if len(formatted) > 24:
+        head = formatted[:24]
+        if not head.rstrip("0."):
+            # The prefix is all zeros: the significant digit lives past the cut. Keep it visible
+            # in scientific form rather than rendering an all-zeros "≈0" label.
+            return f"≈{amount:.2e} {currency}"
+        return head + "… " + currency
+    return formatted + " " + currency
 
 
 def _advertises_free(model: Dict[str, Any]) -> bool:
@@ -867,10 +1057,14 @@ def _advertises_free(model: Dict[str, Any]) -> bool:
 
 
 def _pricing_unit(model: Dict[str, Any]) -> str:
-    """The unit the catalog bills ``completionImageTokens`` in, lowercased; '' for per image."""
+    """The unit the catalog bills ``completionImageTokens`` in, lowercased; '' for per image.
+
+    Sanitized like every catalog text field: a hostile unit must not smuggle line breaks or an
+    absurd label into the picker's price column.
+    """
     units = _as_dict(_as_dict(model.get("pricing_units")).get("completionImageTokens"))
     unit = units.get("unit")
-    return unit.strip().lower() if isinstance(unit, str) else ""
+    return _text(unit).lower() if isinstance(unit, str) else ""
 
 
 def _price_label(model: Dict[str, Any], free_classic: bool, has_key: bool) -> str:
@@ -884,6 +1078,8 @@ def _price_label(model: Dict[str, Any], free_classic: bool, has_key: bool) -> st
     """
     paid_only = _as_bool(model.get("paid_only"))
     amount = _as_number(_as_dict(model.get("pricing")).get("completionImageTokens"))
+    # The spec guarantees "pollen", but the catalog publishes the currency — read it live.
+    currency = _text(_as_dict(model.get("pricing")).get("currency"))[:16] or "pollen"
     if amount is not None and amount < 0:
         amount = None  # a negative rate is not a published price, whatever its type
     if free_classic and not has_key:
@@ -903,10 +1099,10 @@ def _price_label(model: Dict[str, Any], free_classic: bool, has_key: bool) -> st
         elif not _as_bool(model.get("flat_rate")) or unit in ("token", "tokens"):
             cost = "charged per token"
         else:
-            cost = _format_price(amount)
+            cost = _format_price(amount, currency)
     # A model priced per variant (a 2K tier, an edit operation) can cost more than the base
     # figure the picker shows, so mark that the figure is a floor.
-    if _as_list(model.get("pricing_variants")) and cost.endswith("pollen"):
+    if _as_list(model.get("pricing_variants")) and cost.endswith(currency):
         cost = f"from {cost}"
     parts = [cost]
     if free_classic:
@@ -929,8 +1125,8 @@ def _iso_date(model: Dict[str, Any]) -> str:
     seconds = float(raw)
     if seconds <= 0:
         return ""
-    # A second-based epoch is 10 digits; a millisecond one is 13. Anything older than the year
-    # 2286 in milliseconds is almost certainly seconds.
+    # A second-based epoch is 10 digits; a millisecond one is 13. The 1e11 boundary is 1973 as
+    # milliseconds and year 5138 as seconds, so realistic epochs in either unit classify correctly.
     if abs(seconds) < 10**11:
         pass
     else:
@@ -996,13 +1192,14 @@ def _derived_default(catalog: List[Dict[str, Any]], classic: set,
 
 
 def _resolve_model(explicit: Optional[str], catalog: List[Dict[str, Any]]) -> Optional[str]:
-    """First candidate naming a catalog model (id or alias), else the first non-empty one.
+    """First candidate naming a catalog model (canonical id preferred over alias), else passthrough.
 
     An unknown id passes through verbatim, so a model added upstream works the day it appears —
     with one exception. Hermes injects the shared top-level ``image_gen.model`` as the explicit
     ``model`` kwarg on every tool call, so an unknown value there is usually another provider's
     leftover id rather than a new Pollinations model; that value falls back to the derived
-    default instead of being sent to Pollinations.
+    default instead of being sent to Pollinations. An explicit env/scoped choice passes through
+    even when it equals the shared value (the bundled resolve_static_model convention).
 
     ``None`` when nothing is configured and the catalog offers no default to derive.
     """
@@ -1010,6 +1207,7 @@ def _resolve_model(explicit: Optional[str], catalog: List[Dict[str, Any]]) -> Op
     config = load_image_gen_config()
     scoped = config.get(PROVIDER_ID)
     shared = config.get("model")
+    shared_norm = shared.strip() if isinstance(shared, str) else ""
     has_key = _api_key() is not None
     classic = _classic_set()
     candidates = [
@@ -1019,17 +1217,28 @@ def _resolve_model(explicit: Optional[str], catalog: List[Dict[str, Any]]) -> Op
         shared,
     ]
     for candidate in candidates:
-        if isinstance(candidate, str) and candidate.strip() in index:
-            return index[candidate.strip()]
-    for candidate in candidates[:3]:
+        if isinstance(candidate, str) and candidate.strip():
+            wanted = candidate.strip()
+            # A canonical name beats an alias: a hostile catalog entry must not shadow a free
+            # model's id with a paid one by claiming it as an alias (the index is first-wins).
+            canonical = next((_name_of(m) for m in catalog if _name_of(m) == wanted), None)
+            if canonical is not None:
+                return canonical
+            if wanted in index:
+                return index[wanted]
+    for position, candidate in enumerate(candidates[:3]):
         value = candidate.strip() if isinstance(candidate, str) else ""
-        if value and value != shared:
-            # An unknown id passes through so a model added upstream works the day it appears.
-            # Keyless, though, only the free classic route can run it, and an id the catalog
-            # does not know there is far more likely a leftover than a brand-new free model.
-            if has_key or value.lower() in classic:
-                return value
-            logger.debug("Ignoring %r: not a catalog model and not served keyless.", value)
+        if not value or not _valid_id(value):
+            continue
+        if position == 0 and value == shared_norm:
+            # The injected shared kwarg carrying an unknown id: likely another provider's leftover.
+            continue
+        # An unknown id passes through so a model added upstream works the day it appears.
+        # Keyless, though, only the free classic route can run it, and an id the catalog
+        # does not know there is far more likely a leftover than a brand-new free model.
+        if has_key or value.lower() in classic:
+            return value
+        logger.debug("Ignoring %r: not a catalog model and not served keyless.", value)
     return _derived_default(catalog, classic, has_key)
 
 
@@ -1054,21 +1263,28 @@ def _image_is_complete(raw: bytes, sniffed: Optional[str]) -> bool:
     """True when the payload carries its format's end marker, not just its magic bytes.
 
     A truncated download keeps its header, so a magic-byte check alone would report success on a
-    file a viewer cannot open.
+    file a viewer cannot open. These are cheap structural pre-filters, not a decode: a crafted
+    tail can still fool the JPEG/GIF markers, so the markers are anchored where the format allows
+    (PNG's IEND is a fixed final chunk; WebP needs a real first chunk).
     """
     if not raw:
         return False
     if sniffed == "image/png":
-        return b"IEND" in raw[-16:]
+        # IEND is the final chunk: 4 zero length bytes + tag + its fixed CRC.
+        return raw.endswith(b"\x00\x00\x00\x00IEND\xaeB`\x82")
     if sniffed == "image/jpeg":
-        return b"\xff\xd9" in raw[-4:]
+        # Some encoders append metadata after EOI; allow a short tail.
+        return b"\xff\xd9" in raw[-64:]
     if sniffed == "image/gif":
         return raw.rstrip().endswith(b";")
     if sniffed == "image/webp":
-        if len(raw) < 12 or raw[:4] != b"RIFF" or raw[8:12] != b"WEBP":
+        if len(raw) < 20 or raw[:4] != b"RIFF" or raw[8:12] != b"WEBP":
             return False
         declared = int.from_bytes(raw[4:8], "little")
-        return len(raw) >= declared + 8
+        return (len(raw) >= declared + 8 and declared >= 12
+                and raw[12:16] in (b"VP8 ", b"VP8L", b"VP8X"))
+    if sniffed == "image/svg+xml":
+        return b"</svg>" in raw[-256:].lower()
     return True
 
 
@@ -1202,7 +1418,9 @@ def _specs(model: Dict[str, Any], free_classic: bool, has_key: bool) -> Dict[str
     # quoting it there would misstate how fast that model actually is.
     keyless_free = free_classic and not has_key
     speed = ""
-    if not keyless_free and _is_number(rpm) and rpm > 0:
+    # 10000 is a display sanity bound, not a Pollinations fact: an absurd finite rpm must not
+    # render as a hundreds-of-digits or scientific-notation label.
+    if not keyless_free and _is_number(rpm) and 0 < rpm <= 10000:
         speed = f"≤{rpm} req/min"
     return {
         "id": _name_of(model),
@@ -1214,6 +1432,7 @@ def _specs(model: Dict[str, Any], free_classic: bool, has_key: bool) -> Dict[str
         "aliases": [clean for a in _as_list(model.get("aliases")) if (clean := _text(a))],
         "price": _price_label(model, free_classic, has_key),
         "price_pollen": _price_value(model),
+        "price_class": _price_class(model),
         "rpm": rpm if _is_number(rpm) else "",
         "speed": speed,
         "modalities": [clean for m in _as_list(model.get("input_modalities"))
@@ -1263,8 +1482,13 @@ def _text_to_image_route(
     current credentials.
     """
     extra: Dict[str, Any] = {"width": width, "height": height}
-    classic_id = _classic_id_for(model, catalog) if _api_key() is None else None
-    if classic_id is not None:
+    key = _api_key()
+    classic_id = _classic_id_for(model, catalog)
+    # Keyless, the classic route is the only route. Keyed, a model the classic API serves but
+    # the gen catalog does not list (the free model after a key is added) would 400 on the enter
+    # API — keep it working on the classic route instead. A catalog-listed model always uses the
+    # enter API once a key is set: clean and unthrottled.
+    if classic_id is not None and (key is None or entry is None):
         extra["mode"] = "free"
         return _Route(
             url=(
@@ -1277,7 +1501,6 @@ def _text_to_image_route(
             error=None,
         )
 
-    key = _api_key()
     if key is None:
         unreachable = _free_route_unavailable()
         reason = (
@@ -1332,12 +1555,14 @@ class PollinationsImageGenProvider(ImageGenProvider):
         return True  # free classic mode needs no credentials
 
     def list_models(self) -> List[Dict[str, Any]]:
-        """Picker rows for the current credential state, cheapest first.
+        """Picker rows for the current credential state, cheapest estimated per-image cost first.
 
-        No key → the free classic model only. Key → every Quest-eligible model. Key plus the
-        ``include_paid_models`` setting → the paid-only catalog too. The user's saved model is
-        always kept visible, so removing the key or turning the setting off never makes a
-        configured model silently disappear.
+        Per-image and per-megapixel rates are normalized to a per-image estimate; per-token
+        models follow them (no published token count to compare with), and unpublished prices
+        sort last. No key → the free classic model only. Key → every Quest-eligible model. Key
+        plus the ``include_paid_models`` setting → the paid-only catalog too. The user's saved
+        model is always kept visible, so removing the key or turning the setting off never makes
+        a configured model silently disappear.
         """
         catalog = _catalog()
         classic = _classic_set()
@@ -1366,8 +1591,7 @@ class PollinationsImageGenProvider(ImageGenProvider):
             # The classic endpoint is the source of truth for the keyless route: Pollinations can
             # drop a free model from the catalog while still serving it, and a stale catalog must
             # not leave a keyless user with nothing to pick.
-            for key in [item.strip() for item in _classic_models()
-                        if isinstance(item, str) and item.strip()]:
+            for key in [item.strip() for item in _classic_models() if _valid_id(item)]:
                 if key not in rows:
                     # The classic endpoint publishes no metadata, so the row is built from the id
                     # alone; ``input_modalities`` states what the route accepts.
@@ -1380,7 +1604,7 @@ class PollinationsImageGenProvider(ImageGenProvider):
             if saved is not None:
                 rows[configured] = _specs(saved, _is_free_classic(saved, classic), has_key)
 
-        ordered = sorted(rows.values(), key=lambda row: row["price_pollen"])
+        ordered = sorted(rows.values(), key=lambda row: (row["price_class"], row["price_pollen"]))
         return catalog_rows({row["id"]: row for row in ordered}, fields=MODEL_FIELDS)
 
     def default_model(self) -> Optional[str]:
@@ -1437,6 +1661,14 @@ class PollinationsImageGenProvider(ImageGenProvider):
             return error_response(
                 error="Prompt is required", error_type="invalid_input",
                 provider=PROVIDER_ID, prompt="", aspect_ratio=aspect)
+        try:
+            prompt.encode("utf-8")
+        except UnicodeEncodeError:
+            # A lone surrogate survives JSON tool-call decoding but cannot become a URL path
+            # segment; refuse it here instead of letting quote() raise out of generate().
+            return error_response(
+                error="Prompt contains unsupported characters that cannot be sent to Pollinations.",
+                error_type="invalid_input", provider=PROVIDER_ID, prompt="", aspect_ratio=aspect)
 
         catalog = _catalog()
         model = _resolve_model(kwargs.get("model"), catalog)
@@ -1450,26 +1682,52 @@ class PollinationsImageGenProvider(ImageGenProvider):
         entry = _catalog_entry(catalog, model)
         fail = error_factory(PROVIDER_ID, aspect, model=model, prompt=prompt)
 
+        # The paid toggle gates invocation, not just the picker: a paid-only catalog model must
+        # not spend while the setting is off, whichever path (kwarg, env, config) selected it.
+        # Keyless calls keep the free-route guidance below; an id the catalog does not know
+        # cannot be classified and passes through as before.
+        if (_api_key() is not None and entry is not None
+                and _as_bool(entry.get("paid_only"))
+                and not _include_paid_models(self._plugin_id)):
+            return fail(
+                f"Model '{model}' is paid-only and 'Include paid models' is off. Enable it "
+                "under Desktop → Settings → Plugins → Pollinations, or pick a Quest-eligible "
+                "model.", "paid_model_disabled")
+
         # A source image means an edit, which only the enter API can do; the free classic route
-        # is text-to-image only, so there is nothing to fall back to.
-        sources = collect_source_images(image_url, reference_image_urls)
+        # is text-to-image only, so there is nothing to fall back to. Dedupe order-preserving:
+        # the agent commonly repeats image_url inside the references, and a duplicate would eat
+        # a reference slot and double-count against the payload budget (bundled krea does the same).
+        sources = list(dict.fromkeys(collect_source_images(image_url, reference_image_urls)))
+        seed = _seed_from(kwargs)
         if sources:
             return self._edit(prompt, aspect, model, entry, sources, width, height,
-                              kwargs.get("resolution"), fail)
+                              kwargs.get("resolution"), seed, fail)
 
-        seed = random.randint(0, SEED_MAX)
-        route = _text_to_image_route(
-            prompt, model, entry, catalog, width, height, seed,
-            str(kwargs.get("resolution") or "").strip().lower())
+        try:
+            route = _text_to_image_route(
+                prompt, model, entry, catalog, width, height, seed,
+                str(kwargs.get("resolution") or "").strip().lower())
+        except Exception:
+            # Defense in depth: every id/prompt is guarded above, but a URL-building failure
+            # must degrade to an error response, never escape generate().
+            logger.debug("Could not build the Pollinations request", exc_info=True)
+            return fail("Could not build the Pollinations request — the prompt or model id "
+                        "contains unsupported characters.", "invalid_input")
         if route.error:
             return fail(route.error, route.error_type or "auth_required")
         url, headers, extra = route.url or "", route.headers or {}, route.extra
 
         try:
-            data = _http_get_bytes(url, headers=headers)
+            data, produced = _http_get_image(url, headers=headers)
         except Exception as exc:
             return _request_failed(exc, action="image generation",
                                    mode=str(extra.get("mode") or "quest"), fail=fail)
+        if produced is not None:
+            # The API announced the produced size (it can clamp oversized requests); report it
+            # instead of the requested one, keeping the request alongside for transparency.
+            extra["requested_width"], extra["requested_height"] = extra["width"], extra["height"]
+            extra["width"], extra["height"] = produced
 
         if not data:
             return fail("Pollinations returned an empty body", "empty_response")
@@ -1503,6 +1761,7 @@ class PollinationsImageGenProvider(ImageGenProvider):
         width: int,
         height: int,
         resolution: Any,
+        seed: int,
         fail: Callable[[str, str], Dict[str, Any]],
     ) -> Dict[str, Any]:
         """``POST /v1/images/edits`` with the source images inlined as data URIs.
@@ -1521,6 +1780,10 @@ class PollinationsImageGenProvider(ImageGenProvider):
             hint = f" Edit-capable models: {', '.join(options)}." if options else ""
             return fail(f"Model '{model}' cannot edit images.{hint}", "unsupported")
 
+        if len(prompt) > EDIT_PROMPT_LIMIT:
+            return fail(
+                f"The edit prompt is {len(prompt)} characters; the API accepts at most "
+                f"{EDIT_PROMPT_LIMIT}. Shorten it and try again.", "invalid_input")
         # Hermes caps the reference count in its schema, but a direct call could over-send.
         cap = _reference_cap(entry)
         dropped = max(0, len(sources) - cap)
@@ -1528,11 +1791,21 @@ class PollinationsImageGenProvider(ImageGenProvider):
 
         inlined: List[Dict[str, str]] = []
         total = 0
+        # Account BEFORE the base64 blow-up: each source can grow to ~4/3 of its raw cap, and the
+        # prompt plus JSON framing count against the same budget. Rejecting early keeps transient
+        # memory bounded instead of encoding an image that cannot fit.
+        overhead = len(prompt) + 1024
+        worst_case = (MAX_INPUT_IMAGE_BYTES * 4) // 3 + 256
         try:
             for source in sources:
+                if total + worst_case + overhead > MAX_EDIT_PAYLOAD_BYTES:
+                    return fail(
+                        "Those reference images are too large to send "
+                        f"(limit {MAX_EDIT_PAYLOAD_BYTES // (1024 * 1024)}MB including the "
+                        "prompt). Use fewer or smaller images.", "invalid_input")
                 data_url = _to_data_url(source)
                 total += len(data_url)
-                if total > MAX_EDIT_PAYLOAD_BYTES:
+                if total + overhead > MAX_EDIT_PAYLOAD_BYTES:
                     return fail(
                         f"Those reference images are too large to send "
                         f"({total // (1024 * 1024)}MB so far, limit "
@@ -1553,7 +1826,7 @@ class PollinationsImageGenProvider(ImageGenProvider):
             "image": image,
             "model": model,
             "size": f"{width}x{height}",
-            "seed": random.randint(0, SEED_MAX),
+            "seed": seed,
             "response_format": "b64_json",
         }
         # Hermes' resolution creative control is only meaningful for models that price by it.
@@ -1606,8 +1879,20 @@ class PollinationsImageGenProvider(ImageGenProvider):
             except Exception as exc:
                 return fail(f"Could not save the edited image: {exc}", "io_error")
         elif isinstance(url, str) and url:
+            from tools.url_safety import is_safe_url
+
+            if not is_safe_url(url):
+                # The response URL is upstream-chosen; never hand an unvetted target (e.g. a
+                # link-local metadata address) to the agent as the result image.
+                logger.debug("Edit response URL failed the SSRF safety check")
+                return fail("Pollinations returned an unsafe image URL", "invalid_response")
             remote = True
-            image_ref = str(cache_url_best_effort(url, prefix="pollinations", label="Pollinations"))
+            # on_fail keeps the full (possibly signed) URL out of the default-level log.
+            image_ref = str(cache_url_best_effort(
+                url, prefix="pollinations", label="Pollinations",
+                on_fail=lambda exc: logger.debug(
+                    "Pollinations edit image URL could not be cached (%s); using the bare URL.",
+                    exc)))
         else:
             return fail("Pollinations returned neither image data nor a URL", "empty_response")
 
@@ -1617,6 +1902,12 @@ class PollinationsImageGenProvider(ImageGenProvider):
             extra["remote"] = True
         if dropped:
             extra["dropped_references"] = dropped
+        # Token-billed edit models return a usage block; record it against the session like the
+        # bundled token-metered providers do. A no-op outside a turn or without tokens.
+        try:
+            record_token_usage(answered.get("usage"), model=model, provider=PROVIDER_ID)
+        except Exception as exc:
+            logger.debug("Could not record Pollinations edit usage: %s", exc)
         return success_response(
             image=image_ref, model=model, prompt=prompt, aspect_ratio=aspect,
             provider=PROVIDER_ID, modality="image", extra=extra)
