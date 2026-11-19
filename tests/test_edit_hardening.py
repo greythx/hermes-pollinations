@@ -72,7 +72,7 @@ def _edit_setup(mod, *, entry_extra=None, post_response=None):
     setattr(mod, "_catalog", lambda: [entry])
     setattr(mod, "_classic_models", lambda: [])
     setattr(mod, "_include_paid_models", lambda pid: False)
-    setattr(mod, "_to_data_url", lambda v: f"data:image/png;base64,{PNG_B64}")
+    setattr(mod, "_to_data_url", lambda v, limit=1000000: f"data:image/png;base64,{PNG_B64}")
     setattr(mod, "save_b64_image",
             lambda b64, *, prefix="image", extension="png": f"/tmp/{prefix}_test.{extension}")
 
@@ -137,15 +137,37 @@ def test_published_reference_cap_honored():
     assert res["dropped_references"] == 5, res
 
 
-def test_payload_cap_rejects_before_encoding_next():
+def test_small_second_reference_fits_after_large_first():
     mod = _require()
     _edit_setup(mod)
-    setattr(mod, "MAX_INPUT_IMAGE_BYTES", 1000)
+    setattr(mod, "MAX_INPUT_IMAGE_BYTES", 10000)
     setattr(mod, "MAX_EDIT_PAYLOAD_BYTES", 3000)
     calls = []
 
-    def _encode(value):
-        calls.append(value)
+    def _encode(value, limit=10000):
+        calls.append(limit)
+        if len(calls) == 1:
+            return "data:image/png;base64," + "A" * 1380
+        return "data:image/png;base64," + "A" * max(0, (limit * 3) // 4 - 20)
+
+    setattr(mod, "_to_data_url", _encode)
+    res = mod.PollinationsImageGenProvider().generate(
+        "edit", model="test/edit-model", image_url="https://example.com/a.png",
+        reference_image_urls=["https://example.com/b.png"])
+    assert res["success"] is True, res
+    assert len(calls) == 2, calls
+    assert len(res["image"]) > 0
+
+
+def test_payload_rejected_when_budget_exhausted():
+    mod = _require()
+    _edit_setup(mod)
+    setattr(mod, "MAX_INPUT_IMAGE_BYTES", 1000)
+    setattr(mod, "MAX_EDIT_PAYLOAD_BYTES", 2500)
+    calls = []
+
+    def _encode(value, limit=1000):
+        calls.append(limit)
         return "data:image/png;base64," + "A" * 1380
 
     setattr(mod, "_to_data_url", _encode)
@@ -157,12 +179,33 @@ def test_payload_cap_rejects_before_encoding_next():
     assert len(calls) == 1, calls
 
 
+def test_encoder_limit_bounded_by_remaining_budget():
+    mod = _require()
+    _edit_setup(mod)
+    setattr(mod, "MAX_INPUT_IMAGE_BYTES", 10000)
+    setattr(mod, "MAX_EDIT_PAYLOAD_BYTES", 3000)
+    limits = []
+
+    def _encode(value, limit=10000):
+        limits.append(limit)
+        return "data:image/png;base64," + "A" * max(0, (limit * 3) // 4 - 20)
+
+    setattr(mod, "_to_data_url", _encode)
+    res = mod.PollinationsImageGenProvider().generate(
+        "edit", model="test/edit-model", image_url="https://example.com/a.png",
+        reference_image_urls=["https://example.com/b.png"])
+    assert res["success"] is True, res
+    assert len(limits) == 2, limits
+    assert all(0 < lim <= 10000 for lim in limits), limits
+    assert limits[1] < limits[0], limits
+
+
 def test_prompt_counted_against_payload_cap():
     mod = _require()
     _edit_setup(mod)
     setattr(mod, "MAX_EDIT_PAYLOAD_BYTES", 2000)
     calls = []
-    setattr(mod, "_to_data_url", lambda v: calls.append(v) or "data:image/png;base64,AAAA")
+    setattr(mod, "_to_data_url", lambda v, limit=1000000: calls.append(v) or "data:image/png;base64,AAAA")
     res = mod.PollinationsImageGenProvider().generate(
         "x" * 1500, model="test/edit-model", image_url="https://example.com/a.png")
     assert res["success"] is False, res
@@ -230,7 +273,28 @@ def test_edit_invalid_seed_falls_back_to_random():
             "edit", model="test/edit-model", image_url="https://example.com/a.png", seed=bad)
         assert res["success"] is True, res
         seed = captured["payload"]["seed"]
-        assert isinstance(seed, int) and 0 <= seed <= mod.SEED_MAX, (bad, seed)
+        # type() is int, not isinstance: True is an int subclass and must not pass as a seed.
+        assert type(seed) is int and 0 <= seed <= mod.SEED_MAX, (bad, seed)
+
+
+def test_usage_recorded_even_when_save_fails():
+    mod = _require()
+    usage = {"input_tokens": 5, "output_tokens": 10, "total_tokens": 15}
+    _edit_setup(mod, post_response={"data": [{"b64_json": PNG_B64}], "usage": usage})
+    recorded = []
+    setattr(mod, "record_token_usage",
+            lambda u, *, model, provider, base_url=None: recorded.append(u))
+
+    def _boom(b64, *, prefix="image", extension="png"):
+        raise OSError("disk full")
+
+    setattr(mod, "save_b64_image", _boom)
+    res = mod.PollinationsImageGenProvider().generate(
+        "edit", model="test/edit-model", image_url="https://example.com/a.png")
+    assert res["success"] is False, res
+    assert res["error_type"] == "io_error", res
+    # The upstream edit completed and billed tokens; a local save failure must not lose that.
+    assert recorded == [usage], recorded
 
 
 def _main() -> int:

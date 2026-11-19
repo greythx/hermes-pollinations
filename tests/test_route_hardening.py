@@ -140,10 +140,51 @@ def test_t2i_seed_kwarg_honored():
 def test_t2i_invalid_seed_falls_back_to_random():
     mod = _require()
     captured = _route_setup(mod, catalog=[dict(QUEST)], classic=[])
-    for bad in (True, -1, 2**31, "42"):
-        mod.PollinationsImageGenProvider().generate("a cat", model="test/quest-model", seed=bad)
-        seed = int(parse_qs(urlsplit(captured["url"]).query)["seed"][0])
-        assert 0 <= seed <= mod.SEED_MAX, (bad, seed)
+    orig_random = mod.random
+
+    class _SeqRandom:
+        def __init__(self):
+            self.calls = 0
+
+        def randint(self, a, b):
+            self.calls += 1
+            return 100 + self.calls
+
+    setattr(mod, "random", _SeqRandom())
+    try:
+        for n, bad in enumerate((True, -1, 2**31, "42"), start=1):
+            captured.clear()
+            res = mod.PollinationsImageGenProvider().generate(
+                "a cat", model="test/quest-model", seed=bad)
+            assert res["success"] is True, res
+            seed = int(parse_qs(urlsplit(captured["url"]).query)["seed"][0])
+            assert seed == 100 + n, (bad, seed)
+    finally:
+        setattr(mod, "random", orig_random)
+
+
+def test_shared_classic_id_not_suppressed():
+    mod = _require()
+    _route_setup(mod, catalog=[dict(QUEST)], classic=["sana"])
+    setattr(mod, "load_image_gen_config", lambda: {"model": "sana"})
+    # The injected shared kwarg carries a classic-served id: it must resolve to that model
+    # (the classic route can run it keyed), not fall back to a billed Quest default.
+    assert mod._resolve_model("sana", [dict(QUEST)]) == "sana"
+
+
+def test_keyed_picker_keeps_classic_only_saved_visible():
+    mod = _require()
+    _route_setup(mod, catalog=[dict(QUEST)], classic=["sana"])
+    setattr(mod, "load_image_gen_config", lambda: {"model": "sana"})
+    rows = mod.PollinationsImageGenProvider().list_models()
+    ids = [r["id"] for r in rows]
+    assert "sana" in ids, ids
+    assert "test/quest-model" in ids, ids
+    sana = next(r for r in rows if r["id"] == "sana")
+    # Keyed, this model still runs on the watermarked classic route (the enter API does not
+    # serve it), so the label must not promise the clean enter output.
+    assert "watermark" in sana["price"], sana["price"]
+    assert "no watermark" not in sana["price"], sana["price"]
 
 
 def test_keyed_classic_only_model_uses_free_route():

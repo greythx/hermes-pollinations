@@ -128,6 +128,24 @@ def test_picker_order_free_perimage_permegapixel_pertoken_unknown():
     assert ids == ["e-free", "d-image", "c-megapixel", "b-token", "a-unknown"], ids
 
 
+def test_keyless_free_rows_sort_before_saved_priced_row():
+    mod = _require()
+    # Keyless, every classic-served row is free to this user regardless of the catalog's enter
+    # price; a saved billed model kept visible must not outrank the free rows.
+    catalog = [_model("cat-free", "0.04", flat_rate=True),
+               _model("saved-quest", "0.002", flat_rate=True)]
+    setattr(mod, "_api_key", lambda: None)
+    setattr(mod, "load_image_gen_config", lambda: {"model": "saved-quest"})
+    setattr(mod, "_catalog", lambda: catalog)
+    setattr(mod, "_classic_models", lambda: ["cat-free", "sana"])
+    setattr(mod, "_include_paid_models", lambda pid: False)
+    rows = mod.PollinationsImageGenProvider().list_models()
+    ids = [r["id"] for r in rows]
+    assert set(ids) == {"cat-free", "sana", "saved-quest"}, ids
+    assert ids.index("cat-free") < ids.index("saved-quest"), ids
+    assert ids.index("sana") < ids.index("saved-quest"), ids
+
+
 def _main() -> int:
     tests = [(name, fn) for name, fn in sorted(globals().items())
              if name.startswith("test_") and callable(fn)]

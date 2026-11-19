@@ -106,6 +106,29 @@ def test_paid_edit_refused_before_source_fetch():
     assert calls == [], calls
 
 
+def test_paid_edit_https_source_refused_before_fetch():
+    mod = _require()
+    calls = _setup(mod, include_paid=False)
+    fetches = []
+    orig = mod._remote_image_to_data_url
+
+    def _fetch(value, limit=25 * 1024 * 1024):
+        fetches.append(value)
+        raise AssertionError("source fetched for a gated paid model")
+
+    setattr(mod, "_remote_image_to_data_url", _fetch)
+    try:
+        res = mod.PollinationsImageGenProvider().generate(
+            "make it green", model="test/paid-model",
+            image_url="https://example.com/a.png")
+        assert res["success"] is False, res
+        assert res["error_type"] == "paid_model_disabled", res
+        assert calls == [], calls
+        assert fetches == [], fetches
+    finally:
+        setattr(mod, "_remote_image_to_data_url", orig)
+
+
 def test_paid_model_allowed_when_toggle_on():
     mod = _require()
     calls = _setup(mod, include_paid=True)

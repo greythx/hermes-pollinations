@@ -9,6 +9,7 @@ live currency, and rename visibility. Stdlib-only.
 
 from __future__ import annotations
 
+import atexit
 import importlib.util
 import json
 import logging
@@ -16,6 +17,7 @@ import os
 import shutil
 import struct
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -23,7 +25,9 @@ import zlib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRATCH = Path("/opt/data/cache/scratch/pollinations-audit/hardening-tests")
+_TMP = tempfile.TemporaryDirectory(prefix="pollinations-hardening-")
+atexit.register(_TMP.cleanup)
+SCRATCH = Path(_TMP.name)
 
 
 def _load():
@@ -110,6 +114,38 @@ def test_slow_stale_success_does_not_overwrite_newer_cache():
     assert [m["name"] for m in fresh] == ["new/model"], fresh
     release.set()
     worker.join(5)
+    cached = json.loads(mod._cache_path().read_text())["models"]
+    assert [m["name"] for m in cached] == ["new/model"], cached
+
+
+def test_later_started_fetch_wins_even_when_slower():
+    mod = _require()
+    _isolate(mod, "race2")
+    entered_a, entered_b = threading.Event(), threading.Event()
+    release_a, release_b = threading.Event(), threading.Event()
+    state = {"calls": 0}
+
+    def _get_json(url, timeout=30.0):
+        state["calls"] += 1
+        if state["calls"] == 1:
+            entered_a.set()
+            release_a.wait(5)
+            return [{"name": "old/model", "category": "image"}]
+        entered_b.set()
+        release_b.wait(5)
+        return [{"name": "new/model", "category": "image"}]
+
+    setattr(mod, "_http_get_json", _get_json)
+    worker_a = threading.Thread(target=mod._catalog)
+    worker_a.start()
+    assert entered_a.wait(5), "fetch A never started"
+    worker_b = threading.Thread(target=mod._catalog)
+    worker_b.start()
+    assert entered_b.wait(5), "fetch B never started"
+    release_a.set()
+    worker_a.join(5)  # earlier-started A completes first
+    release_b.set()
+    worker_b.join(5)  # later-started B completes last and must win
     cached = json.loads(mod._cache_path().read_text())["models"]
     assert [m["name"] for m in cached] == ["new/model"], cached
 
@@ -215,6 +251,11 @@ def test_env_equal_to_shared_passes_through():
 
 def test_canonical_name_beats_alias_shadow():
     mod = _require()
+    # Stub the lookups so this test never reaches the live classic endpoint or real config,
+    # regardless of test order.
+    setattr(mod, "_api_key", lambda: "sk_dummy")
+    setattr(mod, "load_image_gen_config", lambda: {})
+    setattr(mod, "_classic_models", lambda: [])
     catalog = [{"name": "evil-paid", "category": "image", "paid_only": True, "aliases": ["flux"]},
                {"name": "flux", "category": "image", "paid_only": False}]
     assert mod._resolve_model("flux", catalog) == "flux"
@@ -249,6 +290,35 @@ def test_contract_gaps_logged():
         assert records == [], records
     finally:
         mod.logger.removeHandler(handler)
+
+
+def test_catalog_without_usable_ids_is_not_a_success():
+    mod = _require()
+    _isolate(mod, "noids")
+    good = [{"name": "good/model", "category": "image"}]
+    # Stale (not fresh) so a fetch is attempted and the decoy answer must not overwrite it.
+    mod.atomic_json_write(mod._cache_path(), {"version": mod.CACHE_SCHEMA,
+                                              "fetched": time.time() - mod.CATALOG_TTL - 10,
+                                              "models": good})
+    # A renamed envelope whose only list carries no model-shaped entries must not overwrite
+    # the good cache: zero usable ids has the same effect as an empty answer.
+    setattr(mod, "_http_get_json", lambda url, timeout=30.0: {"meta": [{"v": 1}]})
+    got = mod._catalog()
+    assert [m["name"] for m in got] == ["good/model"], got
+    cached = json.loads(mod._cache_path().read_text())["models"]
+    assert [m["name"] for m in cached] == ["good/model"], cached
+
+
+def test_cache_entries_without_ids_are_not_a_fresh_hit():
+    mod = _require()
+    _isolate(mod, "noids-cache")
+    mod.atomic_json_write(mod._cache_path(), {"version": mod.CACHE_SCHEMA,
+                                              "fetched": time.time(),
+                                              "models": [{"v": 1}]})
+    fresh = [{"name": "fresh/model", "category": "image"}]
+    setattr(mod, "_http_get_json", lambda url, timeout=30.0: fresh)
+    got = mod._catalog()
+    assert [m["name"] for m in got] == ["fresh/model"], got
 
 
 def _main() -> int:

@@ -39,14 +39,15 @@ Plugins) → the paid-only catalog too. The setting also gates invocation: a pai
 model is refused while it is off, whichever path selected it. The user's saved model is always
 kept visible, so neither change makes it vanish. Rows are ordered by estimated per-image cost:
 per-image and per-megapixel rates are normalized, per-token models follow them, and unpublished
-prices sort last.
+prices sort last; keyless, the free classic rows lead regardless of any enter price.
 
 Picker labels carry the access requirement, watermark and edit support, none of which the
 catalog publishes: the price column reads ``Free · watermark · reduced size · no key needed``
 while keyless,
 and once a key is set that same model becomes ``<amount> pollen · no watermark · needs key`` —
 or states the billing unit when the catalog prices per token or per megapixel rather than per
-image. Edit-capable models add ``· edits``.
+image. A classic-served model the catalog omits keeps the watermarked classic label even keyed,
+because the enter API does not serve it. Edit-capable models add ``· edits``.
 """
 
 from __future__ import annotations
@@ -123,6 +124,11 @@ MAX_RESPONSE_BYTES = 25 * 1024 * 1024
 # client guard (the spec publishes no body-size limit); oversize requests are rejected here
 # before the base64 blow-up rather than failing server-side.
 MAX_EDIT_PAYLOAD_BYTES = 40 * 1024 * 1024
+# Data-URI framing ("data:image/jpeg;base64,") and the smallest source worth fetching: the
+# remaining payload budget is converted to a raw-byte limit for the NEXT image, so a small
+# reference still fits after a large one instead of every image reserving the full 25MB cap.
+_DATA_URI_HEADER_BYTES = 64
+_MIN_SOURCE_BYTES = 64
 # How long a failed free-model lookup is remembered, so a down endpoint is not retried per call.
 NEGATIVE_TTL = 60.0
 # Pollinations accepts a 32-bit signed seed.
@@ -317,6 +323,26 @@ def _retry_after(response: Any) -> Optional[int]:
         return None
 
 
+def _read_prefix(response: Any, limit: int) -> bytes:
+    """Read at most *limit* bytes of a body; never raises on an oversize body.
+
+    An error preview must survive large bodies (the classic route can answer an error status
+    with a full image): raising here would replace the ``_HTTPError`` with a generic failure
+    and lose the status, Retry-After and the route-aware 402/429 guidance. A truncated JSON
+    body falls back to the URL-redacted raw text.
+    """
+    chunks: List[bytes] = []
+    total = 0
+    deadline = time.monotonic() + HTTP_TIMEOUT
+    for chunk in response.iter_bytes():
+        piece = chunk[: limit - total]
+        chunks.append(piece)
+        total += len(piece)
+        if total >= limit or time.monotonic() > deadline:
+            break
+    return b"".join(chunks)
+
+
 def _error_fields(response: Any) -> tuple[Optional[str], str]:
     """The upstream error code and a short, control-character-free preview, safe for the agent.
 
@@ -324,7 +350,7 @@ def _error_fields(response: Any) -> tuple[Optional[str], str]:
     on a long body and leak sibling fields (such as signed URLs) through the raw-text fallback.
     A JSON error body is reduced to its ``error.message``; anything else has its URLs redacted.
     """
-    raw_bytes = _bounded_read(response, "error response", limit=64 * 1024)
+    raw_bytes = _read_prefix(response, 64 * 1024)
     if _sniff_image_mime(raw_bytes) is not None:
         # An error status can carry an image body (the classic route does this when unhealthy);
         # never echo binary garbage into the agent-visible preview.
@@ -539,8 +565,10 @@ def _catalog() -> List[Dict[str, Any]]:
     cached: Optional[List[Dict[str, Any]]] = None
     try:
         raw = read_json_or_empty(path)
-        # A cache written by a different plugin version is ignored rather than trusted.
-        models = ([entry for entry in _as_list(raw.get("models")) if isinstance(entry, dict)]
+        # A cache written by a different plugin version is ignored rather than trusted; entries
+        # without a usable id are dropped here too, so a shapeless cache is not a fresh hit.
+        models = ([entry for entry in _as_list(raw.get("models"))
+                   if isinstance(entry, dict) and _name_of(entry)]
                   if _cache_schema_ok(raw) else [])
         if models:
             cached = models
@@ -559,9 +587,10 @@ def _catalog() -> List[Dict[str, Any]]:
     try:
         models = _unwrap_list(_http_get_json(CATALOG_URL),
                               ("models", "data", "items", "results")) or []
-        # Drop non-object entries at the source, so every consumer can assume a dict rather than
-        # re-checking each element.
-        models = [entry for entry in models if isinstance(entry, dict)]
+        # Drop non-object entries AND entries without a usable id at the source: a renamed
+        # envelope can surface a list that is not models at all, and zero usable ids has the
+        # same effect as an empty answer — it must not overwrite a good cache.
+        models = [entry for entry in models if isinstance(entry, dict) and _name_of(entry)]
         if not models:
             # An empty answer is not a catalog. Treating it as authoritative would overwrite a
             # good cache and empty the picker, so it is handled as a failed fetch instead.
@@ -578,7 +607,9 @@ def _catalog() -> List[Dict[str, Any]]:
                 except Exception as exc:
                     logger.debug("Could not cache Pollinations catalog: %s", exc)
                 _CATALOG_CACHE["negative_until"] = 0.0
-                _CATALOG_CACHE["last_success"] = time.time()
+                # Record the fetch's START token, not its completion time: a later-started
+                # fetch carries newer data and must win even when it completes last.
+                _CATALOG_CACHE["last_success"] = started
         return models
     except Exception as exc:
         logger.debug("Pollinations catalog fetch failed: %s", exc)
@@ -659,7 +690,8 @@ def _classic_models() -> List[str]:
                 _CLASSIC_CACHE["ids"] = list(fetched_ids)
                 _CLASSIC_CACHE["at"] = time.time()
                 _CLASSIC_CACHE["negative_until"] = 0.0
-                _CLASSIC_CACHE["last_success"] = time.time()
+                # START token, not completion time (see _catalog): later-started wins.
+                _CLASSIC_CACHE["last_success"] = started
         return list(fetched_ids)
     if cached:
         return list(cached)
@@ -1067,14 +1099,16 @@ def _pricing_unit(model: Dict[str, Any]) -> str:
     return _text(unit).lower() if isinstance(unit, str) else ""
 
 
-def _price_label(model: Dict[str, Any], free_classic: bool, has_key: bool) -> str:
+def _price_label(model: Dict[str, Any], free_classic: bool, has_key: bool,
+                 *, classic_route: bool = False) -> str:
     """Access requirement, watermark, edit support and cost, every part read from the live catalog.
 
     The catalog publishes no "needs a key", watermark or edit-support label, so all three are
     derived. A model the free classic API serves needs no key, but that route is the watermarked
     one, so once a key is set the same model is billed through the enter API instead and comes
-    back clean. ``supported_endpoints`` decides edit support, ``flat_rate`` whether the published
-    price is per image or per token.
+    back clean — unless ``classic_route`` marks a catalog-omitted model that must keep using the
+    classic route even keyed (the enter API does not serve it). ``supported_endpoints`` decides
+    edit support, ``flat_rate`` whether the published price is per image or per token.
     """
     paid_only = _as_bool(model.get("paid_only"))
     amount = _as_number(_as_dict(model.get("pricing")).get("completionImageTokens"))
@@ -1082,7 +1116,7 @@ def _price_label(model: Dict[str, Any], free_classic: bool, has_key: bool) -> st
     currency = _text(_as_dict(model.get("pricing")).get("currency"))[:16] or "pollen"
     if amount is not None and amount < 0:
         amount = None  # a negative rate is not a published price, whatever its type
-    if free_classic and not has_key:
+    if free_classic and (not has_key or classic_route):
         if paid_only:
             return "Free on the classic route · watermark · reduced size · no key needed"
         return "Free · watermark · reduced size · no key needed"
@@ -1198,7 +1232,8 @@ def _resolve_model(explicit: Optional[str], catalog: List[Dict[str, Any]]) -> Op
     with one exception. Hermes injects the shared top-level ``image_gen.model`` as the explicit
     ``model`` kwarg on every tool call, so an unknown value there is usually another provider's
     leftover id rather than a new Pollinations model; that value falls back to the derived
-    default instead of being sent to Pollinations. An explicit env/scoped choice passes through
+    default instead of being sent to Pollinations — unless the free classic endpoint serves it,
+    in which case the classic route can still run it. An explicit env/scoped choice passes through
     even when it equals the shared value (the bundled resolve_static_model convention).
 
     ``None`` when nothing is configured and the catalog offers no default to derive.
@@ -1230,8 +1265,10 @@ def _resolve_model(explicit: Optional[str], catalog: List[Dict[str, Any]]) -> Op
         value = candidate.strip() if isinstance(candidate, str) else ""
         if not value or not _valid_id(value):
             continue
-        if position == 0 and value == shared_norm:
+        if position == 0 and value == shared_norm and value.lower() not in classic:
             # The injected shared kwarg carrying an unknown id: likely another provider's leftover.
+            # A classic-served id is exempt: the free route can run it (keyed included), so the
+            # user's saved free model must not be swapped for a billed Quest default.
             continue
         # An unknown id passes through so a model added upstream works the day it appears.
         # Keyless, though, only the free classic route can run it, and an id the catalog
@@ -1298,8 +1335,11 @@ def _encode_input_image(raw: bytes) -> str:
     return f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
 
 
-def _remote_image_to_data_url(value: str) -> str:
-    """Fetch a remote source image through the SSRF guard; the edits endpoint takes data URIs."""
+def _remote_image_to_data_url(value: str, limit: int = MAX_INPUT_IMAGE_BYTES) -> str:
+    """Fetch a remote source image through the SSRF guard; the edits endpoint takes data URIs.
+
+    ``limit`` bounds the download by the remaining payload budget, not just the per-image cap.
+    """
     from tools.url_safety import is_safe_url
 
     if not is_safe_url(value):
@@ -1311,13 +1351,13 @@ def _remote_image_to_data_url(value: str) -> str:
         with client.stream("GET", value) as response:
             response.raise_for_status()
             declared = response.headers.get("content-length") or ""
-            if declared.isdigit() and int(declared) > MAX_INPUT_IMAGE_BYTES:
-                raise ValueError(f"source image exceeds {MAX_INPUT_IMAGE_BYTES} bytes")
-            raw = _bounded_read(response, value)
+            if declared.isdigit() and int(declared) > limit:
+                raise ValueError(f"source image exceeds {limit} bytes")
+            raw = _bounded_read(response, value, limit=limit)
     return _encode_input_image(raw)
 
 
-def _local_image_to_data_url(value: str) -> str:
+def _local_image_to_data_url(value: str, limit: int = MAX_INPUT_IMAGE_BYTES) -> str:
     """Read a local source image through the same read guard the file tools use."""
     from agent.file_safety import get_read_block_error
 
@@ -1330,38 +1370,39 @@ def _local_image_to_data_url(value: str) -> str:
     size = path.stat().st_size
     if size <= 0:
         raise ValueError(f"source image path is empty: {value}")
-    if size > MAX_INPUT_IMAGE_BYTES:
-        raise ValueError(f"source image exceeds {MAX_INPUT_IMAGE_BYTES} bytes")
+    if size > limit:
+        raise ValueError(f"source image exceeds {limit} bytes")
     # Read with the same ceiling: a file can change between stat() and read(), and a huge file
     # must not be buffered just because it was small a moment ago.
     with path.open("rb") as handle:
-        raw = handle.read(MAX_INPUT_IMAGE_BYTES + 1)
-    if len(raw) > MAX_INPUT_IMAGE_BYTES:
-        raise ValueError(f"source image exceeds {MAX_INPUT_IMAGE_BYTES} bytes")
+        raw = handle.read(limit + 1)
+    if len(raw) > limit:
+        raise ValueError(f"source image exceeds {limit} bytes")
     return _encode_input_image(raw)
 
 
-def _to_data_url(value: str) -> str:
+def _to_data_url(value: str, limit: int = MAX_INPUT_IMAGE_BYTES) -> str:
     """Inline one source image as a base64 data URI, whatever form Hermes handed us.
 
     Hermes passes source images as public URLs, base64 data URIs or absolute local paths; the
     edits endpoint accepts a URL or an array of ``{image_url}`` objects, and a data URI keeps the
-    request to a single JSON call with no extra upload step.
+    request to a single JSON call with no extra upload step. ``limit`` is the raw-byte budget
+    remaining for this image, so reading and encoding stay inside the payload cap.
     """
     candidate = (value or "").strip()
     if not candidate:
         raise ValueError("blank source image")
     lowered = candidate.lower()
     if lowered.startswith(("http://", "https://")):
-        return _remote_image_to_data_url(candidate)
+        return _remote_image_to_data_url(candidate, limit)
     if lowered.startswith("data:"):
         header, _, data = candidate.partition(",")
         if not header.lower().startswith("data:image/") or ";base64" not in header.lower():
             raise ValueError("source image data URL must be a base64 image")
-        if (len(data) * 3) // 4 > MAX_INPUT_IMAGE_BYTES:
-            raise ValueError(f"source image exceeds {MAX_INPUT_IMAGE_BYTES} bytes")
+        if (len(data) * 3) // 4 > limit:
+            raise ValueError(f"source image exceeds {limit} bytes")
         return _encode_input_image(base64.b64decode(data, validate=True))
-    return _local_image_to_data_url(candidate)
+    return _local_image_to_data_url(candidate, limit)
 
 
 def _visible_edit_models(catalog: List[Dict[str, Any]], *, include_paid: bool,
@@ -1401,7 +1442,8 @@ def _extension_for(content_type: str, url: str) -> str:
     return "jpg"
 
 
-def _specs(model: Dict[str, Any], free_classic: bool, has_key: bool) -> Dict[str, Any]:
+def _specs(model: Dict[str, Any], free_classic: bool, has_key: bool,
+           *, classic_route: bool = False) -> Dict[str, Any]:
     """One catalog entry as picker metadata; unpublished fields stay blank.
 
     ``speed`` carries the catalog's per-user rate limit in plain words, and ``strengths`` leads
@@ -1416,7 +1458,7 @@ def _specs(model: Dict[str, Any], free_classic: bool, has_key: bool) -> Dict[str
     success_rate = health.get("success_rate")
     # per_user_rpm is the authenticated limit; the keyless classic route is per-IP throttled, so
     # quoting it there would misstate how fast that model actually is.
-    keyless_free = free_classic and not has_key
+    keyless_free = free_classic and (not has_key or classic_route)
     speed = ""
     # 10000 is a display sanity bound, not a Pollinations fact: an absurd finite rpm must not
     # render as a hundreds-of-digits or scientific-notation label.
@@ -1430,7 +1472,7 @@ def _specs(model: Dict[str, Any], free_classic: bool, has_key: bool) -> Dict[str
         "description": description,
         "strengths": strengths[:STRENGTHS_LIMIT],
         "aliases": [clean for a in _as_list(model.get("aliases")) if (clean := _text(a))],
-        "price": _price_label(model, free_classic, has_key),
+        "price": _price_label(model, free_classic, has_key, classic_route=classic_route),
         "price_pollen": _price_value(model),
         "price_class": _price_class(model),
         "rpm": rpm if _is_number(rpm) else "",
@@ -1603,8 +1645,19 @@ class PollinationsImageGenProvider(ImageGenProvider):
             saved = next((m for m in catalog if _name_of(m) == configured), None)
             if saved is not None:
                 rows[configured] = _specs(saved, _is_free_classic(saved, classic), has_key)
+            elif _valid_id(configured) and configured.lower() in classic:
+                # A saved classic-only model the catalog omits: the classic route can still run
+                # it (keyed included), so keep the user's choice visible with an honest label.
+                spelling = _classic_spelling().get(configured.lower(), configured)
+                rows[spelling] = _specs({"name": spelling, "input_modalities": ["text"]},
+                                        True, has_key, classic_route=True)
 
-        ordered = sorted(rows.values(), key=lambda row: (row["price_class"], row["price_pollen"]))
+        def _order(row: Dict[str, Any]) -> tuple:
+            if not has_key and row["free_classic"]:
+                return (0, 0.0)  # keyless: the classic route costs nothing, whatever enter prices
+            return (row["price_class"], row["price_pollen"])
+
+        ordered = sorted(rows.values(), key=_order)
         return catalog_rows({row["id"]: row for row in ordered}, fields=MODEL_FIELDS)
 
     def default_model(self) -> Optional[str]:
@@ -1791,19 +1844,22 @@ class PollinationsImageGenProvider(ImageGenProvider):
 
         inlined: List[Dict[str, str]] = []
         total = 0
-        # Account BEFORE the base64 blow-up: each source can grow to ~4/3 of its raw cap, and the
-        # prompt plus JSON framing count against the same budget. Rejecting early keeps transient
-        # memory bounded instead of encoding an image that cannot fit.
+        # Account BEFORE the base64 blow-up: the prompt plus JSON framing count against the same
+        # budget, and each source is read/encoded under the REMAINING budget (converted back to
+        # raw bytes), so a small reference still fits after a large one. Rejecting early keeps
+        # transient memory bounded instead of encoding an image that cannot fit.
         overhead = len(prompt) + 1024
-        worst_case = (MAX_INPUT_IMAGE_BYTES * 4) // 3 + 256
         try:
             for source in sources:
-                if total + worst_case + overhead > MAX_EDIT_PAYLOAD_BYTES:
+                remaining = MAX_EDIT_PAYLOAD_BYTES - total - overhead
+                raw_limit = min(MAX_INPUT_IMAGE_BYTES,
+                                ((remaining - _DATA_URI_HEADER_BYTES) * 3) // 4)
+                if raw_limit < _MIN_SOURCE_BYTES:
                     return fail(
                         "Those reference images are too large to send "
                         f"(limit {MAX_EDIT_PAYLOAD_BYTES // (1024 * 1024)}MB including the "
                         "prompt). Use fewer or smaller images.", "invalid_input")
-                data_url = _to_data_url(source)
+                data_url = _to_data_url(source, limit=raw_limit)
                 total += len(data_url)
                 if total + overhead > MAX_EDIT_PAYLOAD_BYTES:
                     return fail(
@@ -1857,6 +1913,15 @@ class PollinationsImageGenProvider(ImageGenProvider):
         if not isinstance(item, dict):
             return fail("Pollinations returned an unexpected image payload", "invalid_response")
 
+        # Token-billed edit models return a usage block; record it against the session like the
+        # bundled token-metered providers do. Record BEFORE local processing: the upstream edit
+        # already completed and billed, so a decode/save failure must not lose the accounting.
+        # A no-op outside a turn or without tokens; failures stay non-fatal.
+        try:
+            record_token_usage(answered.get("usage"), model=model, provider=PROVIDER_ID)
+        except Exception as exc:
+            logger.debug("Could not record Pollinations edit usage: %s", exc)
+
         # A URL response is cached rather than decoded; only raster payloads are sniffed.
         url = item.get("url")
         encoded = item.get("b64_json")
@@ -1902,12 +1967,6 @@ class PollinationsImageGenProvider(ImageGenProvider):
             extra["remote"] = True
         if dropped:
             extra["dropped_references"] = dropped
-        # Token-billed edit models return a usage block; record it against the session like the
-        # bundled token-metered providers do. A no-op outside a turn or without tokens.
-        try:
-            record_token_usage(answered.get("usage"), model=model, provider=PROVIDER_ID)
-        except Exception as exc:
-            logger.debug("Could not record Pollinations edit usage: %s", exc)
         return success_response(
             image=image_ref, model=model, prompt=prompt, aspect_ratio=aspect,
             provider=PROVIDER_ID, modality="image", extra=extra)

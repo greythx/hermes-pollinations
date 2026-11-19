@@ -9,16 +9,20 @@ response instead of raising. Stdlib-only: run ``python3 tests/test_sanitization.
 
 from __future__ import annotations
 
+import atexit
 import importlib.util
 import json
 import shutil
 import sys
+import tempfile
 import time
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRATCH = Path("/opt/data/cache/scratch/pollinations-audit/sanitization-tests")
+_TMP = tempfile.TemporaryDirectory(prefix="pollinations-sanitization-")
+atexit.register(_TMP.cleanup)
+SCRATCH = Path(_TMP.name)
 
 
 def _load():

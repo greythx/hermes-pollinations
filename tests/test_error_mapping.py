@@ -51,9 +51,10 @@ def _require():
 
 
 class _FakeResponse:
-    def __init__(self, body: bytes, headers=None):
+    def __init__(self, body: bytes, headers=None, status_code: int = 200):
         self._body = body
         self.headers = headers or {}
+        self.status_code = status_code
 
     def iter_bytes(self):
         yield self._body
@@ -173,6 +174,55 @@ def test_binary_error_body_not_echoed():
     code, preview = mod._error_fields(_FakeResponse(jpeg))
     assert code is None, code
     assert preview == "(non-text error body)", preview
+
+
+def test_oversize_error_body_preserves_status_mapping():
+    mod = _require()
+    # A 429 with a 100KiB image body (the classic route can answer errors with a full image):
+    # the preview must not raise, and the _HTTPError status/Retry-After mapping must survive.
+    big = b"\xff\xd8\xff\xe0" + b"\x00" * (100 * 1024)
+    resp = _FakeResponse(big, headers={"retry-after": "45"}, status_code=429)
+
+    class _Ctx:
+        def __enter__(self):
+            return resp
+
+        def __exit__(self, *a):
+            return False
+
+    class _Client:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def stream(self, method, url, **kw):
+            return _Ctx()
+
+    orig = mod._ssrf_client
+    setattr(mod, "_ssrf_client", lambda timeout, **kw: _Client())
+    try:
+        try:
+            mod._http_get_image("https://image.pollinations.ai/prompt/x")
+            raise AssertionError("expected _HTTPError")
+        except mod._HTTPError as exc:
+            assert exc.status == 429, exc.status
+            assert exc.retry_after == 45, exc.retry_after
+            res = mod._request_failed(exc, action="image generation", mode="free",
+                                      fail=_fail(mod))
+            assert res["error_type"] == "rate_limited", res
+    finally:
+        setattr(mod, "_ssrf_client", orig)
+
+
+def test_oversize_non_json_error_body_redacts_urls():
+    mod = _require()
+    body = ("upstream failure " + "x" * (100 * 1024)
+            + " https://cdn.example/img?sig=SUPERSECRET").encode()
+    code, preview = mod._error_fields(_FakeResponse(body))
+    assert "SUPERSECRET" not in preview, preview
+    assert len(preview) <= 200, len(preview)
 
 
 def _main() -> int:
