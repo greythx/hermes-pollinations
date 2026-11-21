@@ -1135,7 +1135,11 @@ def _text(value: Any) -> str:
     """
     if not isinstance(value, str):
         return ""
-    return "".join(ch for ch in value[:TEXT_LIMIT] if ch.isprintable() or ch in " \t").strip()
+    # Newlines become spaces (dropping them fuses words: "Labs\n\nQuest" -> "LabsQuest");
+    # other control characters are dropped so a hostile entry cannot smuggle line breaks.
+    cleaned = "".join(ch if ch not in "\n\r" else " "
+                      for ch in value[:TEXT_LIMIT] if ch.isprintable() or ch in " \t\n\r")
+    return " ".join(cleaned.split())
 
 
 def _is_video_model(model: Dict[str, Any]) -> bool:
@@ -1316,6 +1320,37 @@ def _pricing_quantity(model: Dict[str, Any]) -> float:
     return quantity if quantity is not None and quantity > 0 else 1.0
 
 
+def _image_adjustments(model: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """The catalog's per-image pricing adjustments (fees/premiums), shape-guarded.
+
+    Video-kind adjustments belong to video billing and are excluded from image estimates.
+    """
+    return [a for a in _as_list(model.get("pricing_adjustments"))
+            if isinstance(a, dict) and str(a.get("kind") or "image").lower() != "video"]
+
+
+def _adjustments_per_image(model: Dict[str, Any]) -> float:
+    """Sum of adjustments convertible to a per-image pollen figure (generation/image units).
+
+    GPU-second, USD and other unconvertible units are excluded — they surface as a label
+    hint instead of a false estimate. Rates are strings per the spec; guarded like all
+    catalog numbers.
+    """
+    total = 0.0
+    for adj in _image_adjustments(model):
+        unit = _text(adj.get("unit")).lower()
+        if unit not in ("", "generation", "image", "images"):
+            continue
+        if _text(adj.get("currency")).lower() not in ("", "pollen"):
+            continue
+        price = _as_number(adj.get("price"))
+        if price is None or price < 0:
+            continue
+        qty = _as_number(adj.get("quantity"))
+        total += price * (qty if qty is not None and qty > 0 else 1.0)
+    return total
+
+
 def _price_class(model: Dict[str, Any]) -> int:
     """Ordering class: 0 = comparable per-image cost, 1 = per-token (or other unconvertible
     unit), 2 = no published price. Per-token rates cannot be compared to per-image costs
@@ -1323,6 +1358,10 @@ def _price_class(model: Dict[str, Any]) -> int:
     unpublished price sorts last rather than masquerading as the cheapest."""
     amount = _as_number(_as_dict(model.get("pricing")).get("completionImageTokens"))
     if amount is None or amount < 0:
+        pricing = _as_dict(model.get("pricing"))
+        if (_as_number(pricing.get("completionTextTokens")) is not None
+                or _as_number(pricing.get("promptTextTokens")) is not None):
+            return 1  # text-token billing is still per-token, not "unpublished"
         return 2
     if amount == 0:
         return 0
@@ -1341,15 +1380,23 @@ def _price_value(model: Dict[str, Any]) -> float:
     scale by the plugin's typical output area. Per-token rates keep their raw figure (only
     comparable within class 1). Unpublished prices read as zero but sort last via the class.
     """
-    amount = _as_number(_as_dict(model.get("pricing")).get("completionImageTokens"))
-    if amount is None or amount < 0 or amount == 0:
-        return 0.0
+    pricing = _as_dict(model.get("pricing"))
+    amount = _as_number(pricing.get("completionImageTokens"))
+    adjustments = _adjustments_per_image(model)
+    if amount is None or amount < 0:
+        # Text-token-only models keep a class-1 relative figure (completion rate preferred).
+        rate = _as_number(pricing.get("completionTextTokens"))
+        if rate is None:
+            rate = _as_number(pricing.get("promptTextTokens"))
+        return rate if rate is not None and rate >= 0 else 0.0
+    if amount == 0:
+        return adjustments
     unit = _pricing_unit(model)
     quantity = _pricing_quantity(model)
     if unit == "megapixel":
-        return amount * quantity * _TYPICAL_MP
+        return amount * quantity * _TYPICAL_MP + adjustments
     if unit in ("", "image", "images", "generation") and _as_bool(model.get("flat_rate")):
-        return amount * quantity
+        return amount * quantity + adjustments
     return amount
 
 
@@ -1394,6 +1441,8 @@ def _advertises_free(model: Dict[str, Any]) -> bool:
 def _pricing_unit(model: Dict[str, Any]) -> str:
     """The unit the catalog bills ``completionImageTokens`` in, lowercased; '' for per image.
 
+    The spec's unit enum is megapixel/token/byte; image/images/generation are lenient
+    per-image synonyms, and any other unit reads as a generic per-unit charge (class 1).
     Sanitized like every catalog text field: a hostile unit must not smuggle line breaks or an
     absurd label into the picker's price column.
     """
@@ -1423,25 +1472,41 @@ def _price_label(model: Dict[str, Any], free_classic: bool, has_key: bool,
         if paid_only:
             return "Free on the classic route · watermark · reduced size · no key needed"
         return "Free · watermark · reduced size · no key needed"
+    pricing = _as_dict(model.get("pricing"))
+    unit = _pricing_unit(model)
+    flat = unit in ("", "image", "images", "generation") and _as_bool(model.get("flat_rate"))
     if amount is None:
-        # A title that says "free" is marketing copy, not a published price, and a non-classic
-        # model cannot run keyless anyway: both states read "No published price" so the label
-        # never implies free usability the route cannot deliver.
-        cost = "No published price"
+        # No image rate published: text-token rates still mean per-token billing; a name that
+        # says "free" is marketing copy, not a published price, so both states agree.
+        text_rate = (_as_number(pricing.get("completionTextTokens"))
+                     if _as_number(pricing.get("completionTextTokens")) is not None
+                     else _as_number(pricing.get("promptTextTokens")))
+        cost = "charged per token" if text_rate is not None else "No published price"
+    elif unit and unit not in ("image", "images", "generation", "token", "tokens"):
+        # e.g. "megapixel" or "byte": the published figure is per unit, not per image.
+        cost = f"charged per {unit}"
+    elif not flat or unit in ("token", "tokens"):
+        cost = "charged per token"
     else:
-        unit = _pricing_unit(model)
-        if unit and unit not in ("image", "images", "generation", "token", "tokens"):
-            # e.g. "megapixel": the published figure is per unit, not per image.
-            cost = f"charged per {unit}"
-        elif not _as_bool(model.get("flat_rate")) or unit in ("token", "tokens"):
-            cost = "charged per token"
-        else:
-            cost = _format_price(amount, currency)
+        # The per-image figure includes convertible per-generation fees so the label and the
+        # sort estimate agree.
+        cost = _format_price(amount + _adjustments_per_image(model), currency)
     # A model priced per variant (a 2K tier, an edit operation) can cost more than the base
-    # figure the picker shows, so mark that the figure is a floor.
-    if _as_list(model.get("pricing_variants")) and cost.endswith(currency):
-        cost = f"from {cost}"
+    # figure the picker shows, so mark that the figure is a floor — whatever the billing unit.
+    if _as_list(model.get("pricing_variants")):
+        if cost == "Free":
+            cost = "Free base (variants may cost more)"
+        elif cost != "No published price":
+            cost = f"from {cost}"
     parts = [cost]
+    adjustments = _image_adjustments(model)
+    if adjustments and (not flat or any(
+            _text(a.get("unit")).lower() not in ("", "generation", "image", "images")
+            or _text(a.get("currency")).lower() not in ("", "pollen")
+            for a in adjustments)):
+        parts.append("fees extra")
+    if has_key and _as_number(pricing.get("promptImageTokens")) is not None:
+        parts.append("input billed")
     if free_classic:
         parts.append("no watermark")
     if has_key and _supports_edits(model):
