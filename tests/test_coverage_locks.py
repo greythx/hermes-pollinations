@@ -168,8 +168,8 @@ def test_price_label_classic_route_paid_only():
 
 def test_classic_fresh_memory_hit_skips_fetch():
     mod = _require()
-    orig = mod._CLASSIC_CACHE.copy()
-    mod._CLASSIC_CACHE.update({"at": time.time(), "ids": ["memory-id"],
+    orig = mod._classic_state().copy()
+    mod._classic_state().update({"at": time.time(), "ids": ["memory-id"],
                                "negative_until": 0.0, "last_success": 0.0})
 
     def _boom(url, timeout=30.0):
@@ -182,7 +182,7 @@ def test_classic_fresh_memory_hit_skips_fetch():
         assert _REAL_CLASSIC_MODELS() == ["memory-id"]
     finally:
         setattr(mod, "_http_get_json", orig_fetch)
-        mod._CLASSIC_CACHE.update(orig)
+        mod._classic_state().update(orig)
 
 
 def test_output_modalities_discriminator():

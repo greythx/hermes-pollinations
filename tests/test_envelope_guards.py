@@ -77,8 +77,8 @@ def _setup(mod, *, fetch=None, classic_fetch=None):
     setattr(mod, "_include_paid_models", lambda pid: False)
     setattr(mod, "_spec_limits",
             lambda: {"edit_prompt_max": 32000, "seed_min": -1, "seed_max": 2147483647})
-    mod._CATALOG_CACHE.update({"negative_until": 0.0, "last_success": 0.0})
-    mod._CLASSIC_CACHE.update({"at": 0.0, "ids": [], "negative_until": 0.0, "last_success": 0.0})
+    mod._catalog_state().update({"negative_until": 0.0, "last_success": 0.0})
+    mod._classic_state().update({"at": 0.0, "ids": [], "negative_until": 0.0, "last_success": 0.0})
 
     def _get_json(url, timeout=30.0):
         if "image/models" in url:
@@ -120,7 +120,7 @@ def test_classic_memory_future_at_not_fresh():
     mod = _require()
     import time
     _setup(mod, classic_fetch=["fresh"])
-    mod._CLASSIC_CACHE.update({"at": time.time() + 3600, "ids": ["stale-id"],
+    mod._classic_state().update({"at": time.time() + 3600, "ids": ["stale-id"],
                                "negative_until": 0.0, "last_success": 0.0})
     assert mod._classic_models() == ["fresh"]
 

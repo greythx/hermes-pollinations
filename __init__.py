@@ -90,8 +90,8 @@ from utils import atomic_json_write, read_json_or_empty
 
 logger = logging.getLogger(__name__)
 
-# Warn once per process about an unscoped secret read (see _api_key).
-_UNSCOPED_WARNED = False
+# Warn once per Hermes home about an unscoped secret read (see _api_key).
+_UNSCOPED_WARNED_HOMES: set = set()
 
 CATALOG_URL = "https://gen.pollinations.ai/image/models"
 CLASSIC_MODELS_URL = "https://image.pollinations.ai/models"
@@ -205,9 +205,9 @@ def _api_key() -> Optional[str]:
         except UnscopedSecretError:
             # Deliberate keyless degradation, but under multiplexing this can also mean a
             # spawn-site scoping bug: warn once so it is visible, then stay quiet.
-            global _UNSCOPED_WARNED
-            if not _UNSCOPED_WARNED:
-                _UNSCOPED_WARNED = True
+            home = _home_key()
+            if home not in _UNSCOPED_WARNED_HOMES:
+                _UNSCOPED_WARNED_HOMES.add(home)
                 logger.warning("No secret scope bound for %s; treating it as unset. Under "
                                "multiplexing this can indicate a scoping bug at the spawn site.",
                                name)
@@ -222,6 +222,23 @@ def _api_key() -> Optional[str]:
         if value:
             return value
     return None
+
+
+def _model_env() -> str:
+    """The profile-scoped model override.
+
+    get_secret honours the routed profile and falls through to os.environ single-profile, so
+    a launch-profile POLLINATIONS_IMAGE_MODEL no longer leaks into a routed profile.
+    """
+    from agent.secret_scope import UnscopedSecretError, get_secret
+
+    try:
+        return str(get_secret(MODEL_ENV) or "").strip()
+    except UnscopedSecretError:
+        return ""
+    except Exception as exc:
+        logger.debug("Could not read %s from the secret backend: %s", MODEL_ENV, exc)
+        return ""
 
 
 def _hermes_home() -> Path:
@@ -744,8 +761,20 @@ def _seed_from(kwargs: Dict[str, Any]) -> int:
     return random.randint(bottom, top)
 
 
-_CATALOG_CACHE: Dict[str, Any] = {"negative_until": 0.0, "last_success": 0.0}
+# Cache state is keyed by Hermes home: under multiplexing a routed profile must not inherit
+# another profile's failure window or success token. Locks stay global (cheap, short-held).
+# negative_until/last_success use the MONOTONIC clock (immune to wall-clock skew); disk
+# "fetched" and classic memory "at" stay wall-clock (they compare across processes).
+_CATALOG_STATES: Dict[str, Dict[str, Any]] = {}
 _CATALOG_LOCK = threading.Lock()
+
+
+def _home_key() -> str:
+    return str(_hermes_home())
+
+
+def _catalog_state() -> Dict[str, Any]:
+    return _CATALOG_STATES.setdefault(_home_key(), {"negative_until": 0.0, "last_success": 0.0})
 
 
 def _cache_schema_ok(raw: Dict[str, Any]) -> bool:
@@ -769,6 +798,34 @@ def _note_contract_gaps(models: List[Dict[str, Any]]) -> None:
         if not any(isinstance(m, dict) and field in m for m in models):
             logger.debug("Pollinations catalog publishes no %r field — possible upstream rename.",
                          field)
+
+
+def _guarded_cache_write(path: Path, payload: Dict[str, Any], started: float) -> None:
+    """Atomic cache write guarded against cross-process clobber (POSIX flock, best-effort).
+
+    Under the lock, re-read the disk timestamp: if another process wrote NEWER data while
+    this fetch was in flight, skip the write rather than overwrite it. The payload is stamped
+    with the fetch START, so a later-started fetch wins even when it completes last. On
+    platforms without fcntl (or any lock I/O error) the plain atomic write still applies.
+    """
+    try:
+        import fcntl
+    except ImportError:
+        atomic_json_write(path, payload)
+        return
+    lock_path = path.with_name(path.name + ".lock")
+    try:
+        with open(lock_path, "a") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                disk = read_json_or_empty(path)
+                if float(disk.get("fetched") or 0) > started:
+                    return  # a newer write landed mid-fetch
+                atomic_json_write(path, payload)
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        atomic_json_write(path, payload)
 
 
 def _catalog() -> List[Dict[str, Any]]:
@@ -795,11 +852,12 @@ def _catalog() -> List[Dict[str, Any]]:
     except Exception:
         pass
     with _CATALOG_LOCK:
-        if time.time() < float(_CATALOG_CACHE.get("negative_until") or 0.0):
+        if time.monotonic() < float(_catalog_state().get("negative_until") or 0.0):
             return cached if cached is not None else []
     # Only a fetch that began after the last successful one may record an outcome; otherwise a
     # slow failure would hide a cache another thread has already refreshed.
     started = time.time()
+    started_mono = time.monotonic()
     try:
         models = _unwrap_list(
             _http_get_json(CATALOG_URL), ("models", "data", "items", "results"),
@@ -817,32 +875,36 @@ def _catalog() -> List[Dict[str, Any]]:
         with _CATALOG_LOCK:
             # Mirror the classic guard on SUCCESS too: a slow stale fetch must not overwrite a
             # newer cache another thread already wrote.
-            if started >= float(_CATALOG_CACHE.get("last_success") or 0.0):
+            if started_mono >= float(_catalog_state().get("last_success") or 0.0):
                 try:
-                    # Atomic replace: a concurrent reader must never see a half-written catalog.
-                    atomic_json_write(path, {"version": CACHE_SCHEMA, "fetched": time.time(),
-                                             "models": models})
+                    # Atomic replace, cross-process guarded, stamped with the fetch START.
+                    _guarded_cache_write(path, {"version": CACHE_SCHEMA, "fetched": started,
+                                                "models": models}, started)
                 except Exception as exc:
                     logger.debug("Could not cache Pollinations catalog: %s", exc)
-                _CATALOG_CACHE["negative_until"] = 0.0
+                _catalog_state()["negative_until"] = 0.0
                 # Record the fetch's START token, not its completion time: a later-started
                 # fetch carries newer data and must win even when it completes last.
-                _CATALOG_CACHE["last_success"] = started
+                _catalog_state()["last_success"] = started_mono
         return models
     except Exception as exc:
         logger.debug("Pollinations catalog fetch failed: %s", exc)
         # Remember the failure briefly, whether or not a stale cache exists: the cache still
         # wins, but a down endpoint must cost one timeout per window rather than one per call.
         with _CATALOG_LOCK:
-            if started >= float(_CATALOG_CACHE.get("last_success") or 0.0):
-                _CATALOG_CACHE["negative_until"] = time.time() + NEGATIVE_TTL
+            if started_mono >= float(_catalog_state().get("last_success") or 0.0):
+                _catalog_state()["negative_until"] = time.monotonic() + NEGATIVE_TTL
         # No hardcoded stand-ins: an unreachable catalog means no models to offer.
         return cached if cached is not None else []
 
 
-_CLASSIC_CACHE: Dict[str, Any] = {
-    "at": 0.0, "ids": [], "negative_until": 0.0, "last_success": 0.0}
+_CLASSIC_STATES: Dict[str, Dict[str, Any]] = {}
 _CLASSIC_LOCK = threading.Lock()
+
+
+def _classic_state() -> Dict[str, Any]:
+    return _CLASSIC_STATES.setdefault(
+        _home_key(), {"at": 0.0, "ids": [], "negative_until": 0.0, "last_success": 0.0})
 
 
 def _classic_cache_path() -> Path:
@@ -863,10 +925,10 @@ def _load_classic_cache() -> Optional[List[str]]:
     return ids or None
 
 
-def _store_classic_cache(ids: List[str]) -> None:
+def _store_classic_cache(ids: List[str], started: float) -> None:
     try:
-        atomic_json_write(_classic_cache_path(),
-                          {"version": CACHE_SCHEMA, "fetched": time.time(), "ids": ids})
+        _guarded_cache_write(_classic_cache_path(),
+                             {"version": CACHE_SCHEMA, "fetched": started, "ids": ids}, started)
     except Exception as exc:
         logger.debug("Could not cache the free classic model list: %s", exc)
 
@@ -881,17 +943,27 @@ def _classic_models() -> List[str]:
     timeout per window rather than one per call.
     """
     with _CLASSIC_LOCK:
-        age = time.time() - float(_CLASSIC_CACHE["at"])
+        state = _classic_state()
+        age = time.time() - float(state["at"])
         # A future "at" (backward clock step) must not read as permanently fresh.
         if 0 <= age < CATALOG_TTL:
-            return list(_CLASSIC_CACHE["ids"])
-        if time.time() < float(_CLASSIC_CACHE.get("negative_until") or 0.0):
+            # A newer cross-process disk write wins over this process's memory.
+            try:
+                raw = read_json_or_empty(_classic_cache_path())
+                if _cache_schema_ok(raw) and float(raw.get("fetched") or 0) > float(state["at"]):
+                    state["ids"] = [i.strip() for i in _as_list(raw.get("ids")) if _valid_id(i)]
+                    state["at"] = float(raw["fetched"])
+            except Exception:
+                pass
+            return list(state["ids"])
+        if time.monotonic() < float(_classic_state().get("negative_until") or 0.0):
             # Another process may have written a good cache while this one was failing.
-            return list(_CLASSIC_CACHE["ids"]) or _load_classic_cache() or []
+            return list(_classic_state()["ids"]) or _load_classic_cache() or []
     cached = _load_classic_cache()
     # Only a fetch that began after the last successful one may record an outcome; otherwise a
     # slow failure would hide (or a slow success would overwrite) what a newer fetch produced.
     started = time.time()
+    started_mono = time.monotonic()
     fetched_ids: Optional[List[str]] = None
     try:
         fetched = _unwrap_list(
@@ -914,19 +986,19 @@ def _classic_models() -> List[str]:
         # A successful fetch is authoritative, empty or not: the free route may have been
         # withdrawn, and serving a stale id would send the user to a model that now errors.
         with _CLASSIC_LOCK:
-            if started >= float(_CLASSIC_CACHE.get("last_success") or 0.0):
-                _store_classic_cache(fetched_ids)
-                _CLASSIC_CACHE["ids"] = list(fetched_ids)
-                _CLASSIC_CACHE["at"] = time.time()
-                _CLASSIC_CACHE["negative_until"] = 0.0
+            if started_mono >= float(_classic_state().get("last_success") or 0.0):
+                _store_classic_cache(fetched_ids, started)
+                _classic_state()["ids"] = list(fetched_ids)
+                _classic_state()["at"] = time.time()
+                _classic_state()["negative_until"] = 0.0
                 # START token, not completion time (see _catalog): later-started wins.
-                _CLASSIC_CACHE["last_success"] = started
+                _classic_state()["last_success"] = started_mono
         return list(fetched_ids)
     # Remember the failure whether or not a stale cache exists (mirrors _catalog): a down
     # endpoint must cost one timeout per window, not one per call.
     with _CLASSIC_LOCK:
-        if started >= float(_CLASSIC_CACHE.get("last_success") or 0.0):
-            _CLASSIC_CACHE["negative_until"] = time.time() + NEGATIVE_TTL
+        if started_mono >= float(_classic_state().get("last_success") or 0.0):
+            _classic_state()["negative_until"] = time.monotonic() + NEGATIVE_TTL
     return list(cached) if cached else []
 
 
@@ -953,15 +1025,19 @@ def _free_route_unavailable() -> bool:
     told their model is unavailable when the endpoint is simply down.
     """
     with _CLASSIC_LOCK:
-        return time.time() < float(_CLASSIC_CACHE.get("negative_until") or 0.0)
+        return time.time() < float(_classic_state().get("negative_until") or 0.0)
 
 
 def _spec_cache_path() -> Path:
     return _hermes_home() / "cache" / "pollinations_spec_limits.json"
 
 
-_SPEC_CACHE: Dict[str, Any] = {"negative_until": 0.0, "last_success": 0.0}
+_SPEC_STATES: Dict[str, Dict[str, Any]] = {}
 _SPEC_LOCK = threading.Lock()
+
+
+def _spec_state() -> Dict[str, Any]:
+    return _SPEC_STATES.setdefault(_home_key(), {"negative_until": 0.0, "last_success": 0.0})
 
 
 def _is_int(value: Any) -> TypeGuard[int]:
@@ -1027,9 +1103,10 @@ def _spec_limits() -> Dict[str, Optional[int]]:
     except Exception:
         pass
     with _SPEC_LOCK:
-        if time.time() < float(_SPEC_CACHE.get("negative_until") or 0.0):
+        if time.monotonic() < float(_spec_state().get("negative_until") or 0.0):
             return cached if cached is not None else _validated_limits({})
     started = time.time()
+    started_mono = time.monotonic()
     try:
         limits = _spec_limits_from(_http_get_json(SPEC_URL))
         if not any(v is not None for v in limits.values()):
@@ -1038,20 +1115,20 @@ def _spec_limits() -> Dict[str, Optional[int]]:
             # cache survives and the next window retries, rather than caching "unknown".
             raise ValueError("Pollinations spec published no usable limits")
         with _SPEC_LOCK:
-            if started >= float(_SPEC_CACHE.get("last_success") or 0.0):
+            if started_mono >= float(_spec_state().get("last_success") or 0.0):
                 try:
-                    atomic_json_write(path, {"version": CACHE_SCHEMA, "fetched": time.time(),
-                                             "limits": limits})
+                    _guarded_cache_write(path, {"version": CACHE_SCHEMA, "fetched": started,
+                                                "limits": limits}, started)
                 except Exception as exc:
                     logger.debug("Could not cache Pollinations spec limits: %s", exc)
-                _SPEC_CACHE["negative_until"] = 0.0
-                _SPEC_CACHE["last_success"] = started
+                _spec_state()["negative_until"] = 0.0
+                _spec_state()["last_success"] = started_mono
         return limits
     except Exception as exc:
         logger.debug("Pollinations spec fetch failed: %s", exc)
         with _SPEC_LOCK:
-            if started >= float(_SPEC_CACHE.get("last_success") or 0.0):
-                _SPEC_CACHE["negative_until"] = time.time() + NEGATIVE_TTL
+            if started_mono >= float(_spec_state().get("last_success") or 0.0):
+                _spec_state()["negative_until"] = time.monotonic() + NEGATIVE_TTL
         return cached if cached is not None else _validated_limits({})
 
 
@@ -1712,7 +1789,7 @@ def _resolve_model(explicit: Optional[str], catalog: List[Dict[str, Any]]) -> Op
     spelling = _classic_spelling()
     candidates = [
         explicit,
-        os.environ.get(MODEL_ENV, "").strip(),
+        _model_env(),
         scoped.get("model") if isinstance(scoped, dict) else None,
         shared,
     ]

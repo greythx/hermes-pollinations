@@ -129,9 +129,9 @@ def _setup(mod, *, fetch=None):
         return fetch
 
     setattr(mod, "_http_get_json", _get_json)
-    mod._CATALOG_CACHE.update({"negative_until": 0.0, "last_success": 0.0})
-    mod._CLASSIC_CACHE.update({"at": 0.0, "ids": [], "negative_until": 0.0, "last_success": 0.0})
-    mod._SPEC_CACHE.update({"negative_until": 0.0, "last_success": 0.0})
+    mod._catalog_state().update({"negative_until": 0.0, "last_success": 0.0})
+    mod._classic_state().update({"at": 0.0, "ids": [], "negative_until": 0.0, "last_success": 0.0})
+    mod._spec_state().update({"negative_until": 0.0, "last_success": 0.0})
     return captured, calls
 
 
@@ -171,13 +171,13 @@ def test_spec_failure_serves_stale_and_remembers():
         raise OSError("down")
 
     setattr(mod, "_http_get_json", down)
-    mod._SPEC_CACHE.update({"negative_until": 0.0, "last_success": 0.0})
+    mod._spec_state().update({"negative_until": 0.0, "last_success": 0.0})
     lim = UNKNOWN
     for _ in range(5):
         lim = mod._spec_limits()
     assert lim == KNOWN, lim
     assert attempts["n"] == 1, attempts
-    assert mod._SPEC_CACHE["negative_until"] > time.time()
+    assert mod._spec_state()["negative_until"] > time.monotonic()
 
 
 def test_spec_unreachable_no_cache_degrades():
@@ -293,7 +293,7 @@ def test_spec_without_limits_is_failed_fetch():
     _, calls = _setup(mod, fetch={"openapi": "3.1.0", "paths": {}})
     assert mod._spec_limits() == UNKNOWN
     assert not (SCRATCH / "spec.json").exists()
-    assert mod._SPEC_CACHE["negative_until"] > time.time()
+    assert mod._spec_state()["negative_until"] > time.monotonic()
     assert mod._spec_limits() == UNKNOWN
     assert calls["n"] == 1, calls
 

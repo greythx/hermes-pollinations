@@ -64,8 +64,8 @@ def _isolate(mod, tag):
     SCRATCH.mkdir(parents=True, exist_ok=True)
     setattr(mod, "_cache_path", lambda: SCRATCH / f"{tag}_catalog.json")
     setattr(mod, "_classic_cache_path", lambda: SCRATCH / f"{tag}_classic.json")
-    mod._CATALOG_CACHE.update({"negative_until": 0.0, "last_success": 0.0})
-    mod._CLASSIC_CACHE.update({"at": 0.0, "ids": [], "negative_until": 0.0, "last_success": 0.0})
+    mod._catalog_state().update({"negative_until": 0.0, "last_success": 0.0})
+    mod._classic_state().update({"at": 0.0, "ids": [], "negative_until": 0.0, "last_success": 0.0})
     for p in SCRATCH.glob(f"{tag}_*.json"):
         p.unlink()
 
