@@ -76,6 +76,8 @@ can express (1K/2K).
   request URL path (they may appear in intermediary access logs); edit prompts travel in the
   request body.
 - The free route watermarks images and caps output at a reduced size.
+- Models whose live listing advertises SVG output are shown disabled and refused before any
+  request: this plugin returns raster images only, and a paid SVG attempt would bill then fail.
 - Generated images are written to `$HERMES_HOME/cache/generated/images/`. The model catalog,
   the free-model list and the API spec limits are cached under `$HERMES_HOME/cache/`
   (`pollinations_catalog.json`, `pollinations_classic_models.json`, `pollinations_spec_limits.json`).

@@ -243,7 +243,9 @@ def test_fees_hint_without_image_rate():
            "quantity": 1, "unit": "generation"}
     m = {"name": "test/no-rate", "category": "image", "paid_only": False, "flat_rate": True,
          "pricing": {"currency": "pollen"}, "pricing_adjustments": [fee]}
-    assert "fees extra" in mod._price_label(m, False, True)
+    # No base rate published: the fees ARE the price, worded as usage-based fees (T12/B2-2).
+    label = mod._price_label(m, False, True)
+    assert "usage-based fees" in label, label
 
 
 def test_megapixel_label_shows_figure():
