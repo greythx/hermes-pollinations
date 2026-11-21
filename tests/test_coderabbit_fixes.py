@@ -145,8 +145,11 @@ def test_backoff_adopts_newer_withdrawal():
     # fail loudly on any network fetch.
     setattr(mod, "_classic_models", _PRISTINE["_classic_models"])
 
+    calls = []
+
     def _boom(url, timeout=30.0):
-        raise AssertionError("network fetch during backoff")
+        calls.append(url)
+        raise OSError("network fetch during backoff")
 
     setattr(mod, "_http_get_json", _boom)
     mod._classic_state().update({"at": time.time() - 7200, "ids": ["sana"],
@@ -155,6 +158,9 @@ def test_backoff_adopts_newer_withdrawal():
     mod.atomic_json_write(mod._classic_cache_path(),
                           {"version": 1, "fetched": time.time(), "ids": []})
     assert mod._classic_models() == []
+    # The fetch handler swallows exceptions, so assert on the recorded calls: a regressed
+    # backoff branch must not reach the network at all.
+    assert calls == [], calls
 
 
 def test_malformed_ids_not_a_withdrawal():
