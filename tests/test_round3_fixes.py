@@ -270,8 +270,15 @@ def test_edit_only_entry_not_derived_default():
 def test_classic_fallback_paid_filter_keyed():
     mod = _require()
     paid_sana = dict(PAID, name="sana")
-    assert mod._derived_default([paid_sana], {"sana"}, True) is None
-    assert mod._derived_default([paid_sana], {"sana"}, False) == "sana"
+    # The final fallback reads _classic_models(), not the passed set: stub it so the test
+    # exercises the filter independently of shared test state.
+    orig = mod._classic_models
+    setattr(mod, "_classic_models", lambda: ["sana"])
+    try:
+        assert mod._derived_default([paid_sana], {"sana"}, True) is None
+        assert mod._derived_default([paid_sana], {"sana"}, False) == "sana"
+    finally:
+        setattr(mod, "_classic_models", orig)
 
 
 def test_get_png_dimensions_measured():

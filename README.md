@@ -77,7 +77,9 @@ can express (1K/2K).
   request body.
 - The free route watermarks images and caps output at a reduced size.
 - Models whose live listing advertises SVG output are shown disabled and refused before any
-  request: this plugin returns raster images only, and a paid SVG attempt would bill then fail.
+  paid request: this plugin returns raster images only, and a paid SVG attempt would bill then
+  fail. Exception: a keyless user can still run a classic-served SVG model on the free classic
+  route, which always returns a raster JPEG.
 - Generated images are written to `$HERMES_HOME/cache/generated/images/`. The model catalog,
   the free-model list and the API spec limits are cached under `$HERMES_HOME/cache/`
   (`pollinations_catalog.json`, `pollinations_classic_models.json`, `pollinations_spec_limits.json`).

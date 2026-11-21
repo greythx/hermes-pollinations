@@ -177,12 +177,20 @@ def test_classic_fresh_memory_hit_skips_fetch():
 
     orig_fetch = mod._http_get_json
     setattr(mod, "_http_get_json", _boom)
+    # Isolate the disk cache: a live Hermes process writing the user's real cache mid-test
+    # would (correctly) be adopted and break the assertion.
+    import tempfile
+    tmp = Path(tempfile.mkdtemp(prefix="poll_freshmem_"))
+    orig_path = mod._classic_cache_path
+    setattr(mod, "_classic_cache_path", lambda: tmp / "classic.json")
     try:
         assert _REAL_CLASSIC_MODELS is not None
         assert _REAL_CLASSIC_MODELS() == ["memory-id"]
     finally:
         setattr(mod, "_http_get_json", orig_fetch)
+        setattr(mod, "_classic_cache_path", orig_path)
         mod._classic_state().update(orig)
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def test_output_modalities_discriminator():

@@ -87,6 +87,7 @@ from agent.image_gen_provider import (
 from plugins.image_gen._common import (
     api_key_setup_schema, cache_url_best_effort, catalog_rows, collect_source_images,
     error_factory, load_image_gen_config, record_token_usage)
+from hermes_constants import mkdir_under_hermes_home
 from utils import atomic_json_write, read_json_or_empty
 
 logger = logging.getLogger(__name__)
@@ -317,11 +318,13 @@ def _unwrap_list(payload: Any, keys: tuple, *,
         # Positional fallback for a renamed envelope: skip well-known non-model lists and prefer
         # the first model-shaped list, so an "errors" array cannot pose as the catalog.
         fallback: Optional[List[Any]] = None
+        candidates = 0
         for key, value in payload.items():
             if key in ("errors", "warnings", "messages") or not isinstance(value, list):
                 continue
             if fallback_key_ok is not None and not fallback_key_ok(key):
                 continue
+            candidates += 1
             if fallback is None:
                 fallback = value
             if any(isinstance(item, dict)
@@ -329,7 +332,11 @@ def _unwrap_list(payload: Any, keys: tuple, *,
                    for item in value):
                 if fallback_item_ok is None or fallback_item_ok(value):
                     return value
-        if fallback is not None and (fallback_item_ok is None or fallback_item_ok(fallback)):
+        # Several qualifying lists with no model-shaped items are AMBIGUOUS: choosing by key
+        # order could cache a version list as the model list. Treat it as a failed fetch so
+        # the caller's last-good cache survives.
+        if (fallback is not None and candidates == 1
+                and (fallback_item_ok is None or fallback_item_ok(fallback))):
             return fallback
     return None
 
@@ -588,6 +595,12 @@ def _request_failed(exc: Exception, *, action: str, mode: str = "quest",
                 "the retry window, or check the account at https://enter.pollinations.ai.",
                 "rate_limited")
         if exc.status == 403:
+            if mode == "free":
+                # No key was sent on the classic route: do not blame key permissions.
+                return fail(
+                    f"Pollinations returned HTTP 403{detail} — the free classic API refused "
+                    "this anonymous request. Try again later, or pick another model.",
+                    "api_error")
             return fail(
                 f"Pollinations returned HTTP 403{detail} — the key lacks permission for this "
                 "model or operation. Check the account and key permissions at "
@@ -833,19 +846,28 @@ def _unlink_planted_symlink(path: Path) -> None:
         pass
 
 
-def _guarded_cache_write(path: Path, payload: Dict[str, Any], started: float) -> None:
+def _guarded_cache_write(path: Path, payload: Dict[str, Any], started: float) -> bool:
     """Atomic cache write guarded against cross-process clobber (POSIX flock, best-effort).
 
     Under the lock, re-read the disk timestamp: if another process wrote NEWER data while
     this fetch was in flight, skip the write rather than overwrite it. The payload is stamped
     with the fetch START, so a later-started fetch wins even when it completes last. On
     platforms without fcntl (or any lock I/O error) the plain atomic write still applies.
+    Returns True when this payload was written, False when a newer disk write won.
     """
+    try:
+        # Create the parent BEFORE the lock open: a missing dir would otherwise drop both
+        # first fetches into the unlocked fallback, skipping the ordering check. The
+        # tombstone-aware helper never recreates a deleted named profile home.
+        mkdir_under_hermes_home(path.parent)
+    except Exception:
+        return False
     try:
         import fcntl
     except ImportError:
+        _unlink_planted_symlink(path)
         atomic_json_write(path, payload)
-        return
+        return True
     _unlink_planted_symlink(path)
     lock_path = path.with_name(path.name + ".lock")
     try:
@@ -855,7 +877,7 @@ def _guarded_cache_write(path: Path, payload: Dict[str, Any], started: float) ->
         fd = None
     if fd is None:
         atomic_json_write(path, payload)  # no lock available: best-effort write
-        return
+        return True
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
         try:
@@ -864,15 +886,19 @@ def _guarded_cache_write(path: Path, payload: Dict[str, Any], started: float) ->
                 disk_fetched = float(disk.get("fetched") or 0)
             except (TypeError, ValueError, OverflowError):
                 disk_fetched = 0.0  # a corrupt stamp must not immortalize the file
+            if not math.isfinite(disk_fetched):
+                disk_fetched = 0.0  # Infinity would block every later write
             if disk_fetched > started:
-                return  # a newer write landed mid-fetch
+                return False  # a newer write landed mid-fetch
             _unlink_planted_symlink(path)
             atomic_json_write(path, payload)
+            return True
         finally:
             fcntl.flock(fd, fcntl.LOCK_UN)
     except OSError:
         _unlink_planted_symlink(path)
         atomic_json_write(path, payload)
+        return True
     finally:
         os.close(fd)
 
@@ -974,12 +1000,48 @@ def _load_classic_cache() -> Optional[List[str]]:
     return ids or None
 
 
-def _store_classic_cache(ids: List[str], started: float) -> None:
+def _store_classic_cache(ids: List[str], started: float) -> List[str]:
+    """Cache the fetch result; when a newer cross-process write wins, adopt and return IT.
+
+    Called under _CLASSIC_LOCK by _classic_models, so the skip-path state update is safe.
+    """
     try:
-        _guarded_cache_write(_classic_cache_path(),
-                             {"version": CACHE_SCHEMA, "fetched": started, "ids": ids}, started)
+        written = _guarded_cache_write(_classic_cache_path(),
+                                       {"version": CACHE_SCHEMA, "fetched": started, "ids": ids},
+                                       started)
+        if not written:
+            raw = read_json_or_empty(_classic_cache_path())
+            raw_ids = _as_list(raw.get("ids"))
+            valid = [i.strip() for i in raw_ids if _valid_id(i)]
+            if _cache_schema_ok(raw) and (not raw_ids or valid):
+                _classic_state()["ids"] = valid
+                _classic_state()["at"] = float(raw.get("fetched") or started)
+                return valid
     except Exception as exc:
         logger.debug("Could not cache the free classic model list: %s", exc)
+    return ids
+
+
+def _adopt_newer_classic_disk(state: Dict[str, Any]) -> None:
+    """Adopt a newer cross-process classic write over memory (called under _CLASSIC_LOCK).
+
+    A valid EMPTY list is a withdrawal and wins too; a non-empty list with zero valid ids is
+    hostile/corrupt and is ignored. Non-finite stamps never win.
+    """
+    try:
+        raw = read_json_or_empty(_classic_cache_path())
+        if not _cache_schema_ok(raw):
+            return
+        fetched = float(raw.get("fetched") or 0)
+        if not math.isfinite(fetched) or fetched <= float(state["at"]):
+            return
+        raw_ids = _as_list(raw.get("ids"))
+        valid = [i.strip() for i in raw_ids if _valid_id(i)]
+        if not raw_ids or valid:
+            state["ids"] = valid
+            state["at"] = fetched
+    except Exception:
+        pass
 
 
 def _classic_models() -> List[str]:
@@ -997,22 +1059,14 @@ def _classic_models() -> List[str]:
         # A future "at" (backward clock step) must not read as permanently fresh.
         if 0 <= age < CATALOG_TTL:
             # A newer cross-process disk write wins over this process's memory.
-            try:
-                raw = read_json_or_empty(_classic_cache_path())
-                if _cache_schema_ok(raw) and float(raw.get("fetched") or 0) > float(state["at"]):
-                    raw_ids = _as_list(raw.get("ids"))
-                    valid = [i.strip() for i in raw_ids if _valid_id(i)]
-                    # Adopt a withdrawal (empty) or a usable list; non-empty with zero valid
-                    # ids is hostile/corrupt — keep memory (mirrors the live-fetch guard).
-                    if not raw_ids or valid:
-                        state["ids"] = valid
-                        state["at"] = float(raw["fetched"])
-            except Exception:
-                pass
+            _adopt_newer_classic_disk(state)
             return list(state["ids"])
         if time.monotonic() < float(_classic_state().get("negative_until") or 0.0):
-            # Another process may have written a good cache while this one was failing.
-            return list(_classic_state()["ids"]) or _load_classic_cache() or []
+            # Another process may have written a good cache (or a withdrawal) while this one
+            # was failing: a newer disk write wins over stale memory here too.
+            state = _classic_state()
+            _adopt_newer_classic_disk(state)
+            return list(state["ids"]) or _load_classic_cache() or []
     cached = _load_classic_cache()
     # Only a fetch that began after the last successful one may record an outcome; otherwise a
     # slow failure would hide (or a slow success would overwrite) what a newer fetch produced.
@@ -1041,12 +1095,14 @@ def _classic_models() -> List[str]:
         # withdrawn, and serving a stale id would send the user to a model that now errors.
         with _CLASSIC_LOCK:
             if started_mono >= float(_classic_state().get("last_success") or 0.0):
-                _store_classic_cache(fetched_ids, started)
-                _classic_state()["ids"] = list(fetched_ids)
-                _classic_state()["at"] = started
+                winner = _store_classic_cache(fetched_ids, started)
+                _classic_state()["ids"] = list(winner)
+                if winner is fetched_ids:
+                    _classic_state()["at"] = started
                 _classic_state()["negative_until"] = 0.0
                 # START token, not completion time (see _catalog): later-started wins.
                 _classic_state()["last_success"] = started_mono
+                return list(winner)
         return list(fetched_ids)
     # Remember the failure whether or not a stale cache exists (mirrors _catalog): a down
     # endpoint must cost one timeout per window, not one per call.
@@ -1373,6 +1429,9 @@ def _classic_keys(model: Dict[str, Any]) -> List[str]:
     # Aliases get the same _text cleaning as the index, so a whitespace-padded alias
     # still matches the classic set.
     keys = [_name_of(model)] + [_text(a) for a in _as_list(model.get("aliases"))]
+    alt = model.get("id")
+    if isinstance(alt, str) and _valid_id(alt):
+        keys.append(_text(alt))  # the alternate id can be the spelling classic serves
     return [key for key in keys if isinstance(key, str) and key]
 
 
@@ -1698,8 +1757,15 @@ def _price_label(model: Dict[str, Any], free_classic: bool, has_key: bool,
         else:
             cost = "No published price"
     elif amount == 0:
-        # A published zero is Free whatever the unit/flat flag; convertible fees still apply.
-        cost = _format_price(fees, currency)
+        # A published zero image rate is Free only when nothing else is billed: positive
+        # text-token rates still charge, and convertible fees still apply.
+        text_billed = any(
+            (rate := _as_number(pricing.get(field))) is not None and rate > 0
+            for field in ("completionTextTokens", "promptTextTokens"))
+        if text_billed:
+            cost = (_format_price(fees, currency) + " · text billed") if fees else "Free image · text billed"
+        else:
+            cost = _format_price(fees, currency)
         folded = True
     elif unit == "megapixel":
         # rate x quantity is the published per-unit figure — show it (no area assumption).
@@ -1708,7 +1774,7 @@ def _price_label(model: Dict[str, Any], free_classic: bool, has_key: bool,
         shown = amount if floor == 0 else floor
         cost = f"≈{_format_price(shown * _pricing_quantity(model), currency)} per megapixel"
         if floor == 0:
-            cost += " (free variant)"
+            cost += f" (variant {_format_price(fees, currency)})" if fees else " (free variant)"
     elif unit and unit not in ("image", "images", "generation", "token", "tokens"):
         # e.g. "byte": a generic per-unit charge, display-bounded like every label field.
         cost = f"charged per {unit[:32]}"
@@ -1722,7 +1788,7 @@ def _price_label(model: Dict[str, Any], free_classic: bool, has_key: bool,
         shown = amount if floor == 0 else floor
         cost = _format_price(shown * _pricing_quantity(model) + fees, currency)
         if floor == 0:
-            cost += " (free variant)"
+            cost += f" (variant {_format_price(fees, currency)})" if fees else " (free variant)"
         folded = True
     # A model priced per variant (a 2K tier, an edit operation) can cost more than the base
     # figure the picker shows: a numeric floor reads "from X"; a per-unit figure says so.
@@ -1733,7 +1799,7 @@ def _price_label(model: Dict[str, Any], free_classic: bool, has_key: bool,
             and 0 <= rate < amount for v in variants)
         if cost == "Free":
             cost = "Free base (variants may cost more)"
-        elif "(free variant)" in cost:
+        elif "(free variant)" in cost or "(variant " in cost:
             # The note explains the cheaper direction; still warn about pricier variants.
             if amount is not None and any(
                     (rate := _as_number(_as_dict(v).get("completionImageTokens"))) is not None
@@ -1887,7 +1953,11 @@ def _derived_default(catalog: List[Dict[str, Any]], classic: set,
             # a plainly free one is the better default. Keyed, generate() refuses paid-only
             # models while the toggle is off, so they are no derived default at all.
             if _paid_flag(model) is False:
-                return name
+                # Keyed, a catalog-listed model routes to ENTER even when classic serves it:
+                # an SVG or edits-only entry would be refused there, so keep looking. Keyless
+                # classic rasterizes to JPEG and runs (the SVG exception).
+                if not has_key or (not _is_svg_product(model) and _has_t2i_signal(model)):
+                    return name
             if free_fallback is None and not has_key:
                 free_fallback = name
         if (fallback is None and has_key and _paid_flag(model) is False
@@ -1954,6 +2024,12 @@ def _resolve_model(explicit: Optional[str], catalog: List[Dict[str, Any]]) -> Op
                 if entry is not None and _is_image_model(entry) and _paid_flag(entry) is False:
                     return target
                 return spelling[key]
+            # A normalized CANONICAL beats another model's exact alias (the folded index is
+            # canonical-first), so a case variant of a free id cannot be hijacked by a paid
+            # entry claiming the lowercase spelling as an alias.
+            target = folded.get(key)
+            if target is not None and any(_name_of(m) == target for m in catalog):
+                return target
             if wanted in index:
                 return index[wanted]
             if key in folded:
@@ -2138,7 +2214,7 @@ def _visible_edit_models(catalog: List[Dict[str, Any]], *, include_paid: bool,
             continue
         if _is_svg_product(model):
             continue
-        if _paid_flag(model) is not False and not include_paid:
+        if _paid_flag(model) is None or (_paid_flag(model) is not False and not include_paid):
             continue
         name = _name_of(model)
         if name:
@@ -2348,6 +2424,8 @@ class PollinationsImageGenProvider(ImageGenProvider):
             if not has_key:
                 if not free_classic:
                     continue  # state 1: the free classic API is the only keyless route
+            elif _paid_flag(model) is None:
+                continue  # unreadable billing: generate() refuses it regardless of the toggle
             elif _paid_flag(model) is not False and not include_paid:
                 # state 2: Quest-eligible only (unreadable flags stay hidden). Keyed, a
                 # paid-only model is refused by generate() even when classic serves it, so
@@ -2383,6 +2461,8 @@ class PollinationsImageGenProvider(ImageGenProvider):
                         # classic-served call, which rasterizes to JPEG and runs. Mirror that
                         # exemption so the marker never contradicts what generate() does.
                         rows[configured]["price"] += " · disabled (SVG output unsupported)"
+                    elif has_key and _paid_flag(saved) is None:
+                        rows[configured]["price"] += " · disabled (unreadable billing flag)"
                     elif has_key and _paid_flag(saved) is not False and not include_paid:
                         # Say plainly that generate() will refuse this row until the toggle
                         # is on, rather than offering an unrunnable choice unexplained.
@@ -2443,8 +2523,8 @@ class PollinationsImageGenProvider(ImageGenProvider):
         entry = _catalog_entry(catalog, _configured_model(catalog))
         if entry is None or not _is_image_model(entry) or (_api_key() and _is_svg_product(entry)):
             entry = None
-        if (entry is not None and _paid_flag(entry) is not False
-                and not _include_paid_models(self._plugin_id)):
+        if (entry is not None and (_paid_flag(entry) is None
+                or (_paid_flag(entry) is not False and not _include_paid_models(self._plugin_id)))):
             # generate() refuses this model while the toggle is off; the schema must not
             # advertise edits/resolution the call cannot perform.
             entry = None
@@ -2652,8 +2732,16 @@ class PollinationsImageGenProvider(ImageGenProvider):
         # budget, and each source is read/encoded under the REMAINING budget (converted back to
         # raw bytes), so a small reference still fits after a large one. Rejecting early keeps
         # transient memory bounded instead of encoding an image that cannot fit.
-        # The prompt is JSON-encoded as UTF-8: count bytes, not code points.
-        overhead = len(prompt.encode("utf-8")) + len(model.encode("utf-8")) + 1280
+        # Budget the SERIALIZED fixed fields: JSON escapes (interior newlines, quotes,
+        # control chars) expand the body beyond the raw UTF-8 byte count.
+        fixed_fields: Dict[str, Any] = {
+            "prompt": prompt, "image": [], "model": model, "size": f"{width}x{height}",
+            "seed": seed, "response_format": "b64_json",
+        }
+        requested = str(resolution or "").strip().lower()
+        if requested and requested in _published_resolutions(entry):
+            fixed_fields["resolution"] = requested
+        overhead = len(json.dumps(fixed_fields, ensure_ascii=False).encode("utf-8"))
         try:
             for source in sources:
                 remaining = MAX_EDIT_PAYLOAD_BYTES - total - overhead
@@ -2684,18 +2772,14 @@ class PollinationsImageGenProvider(ImageGenProvider):
                         "See the Hermes log for detail.", _network_error_type(exc))
         image = inlined
 
-        payload: Dict[str, Any] = {
-            "prompt": prompt,
-            "image": image,
-            "model": model,
-            "size": f"{width}x{height}",
-            "seed": seed,
-            "response_format": "b64_json",
-        }
-        # Hermes' resolution creative control is only meaningful for models that price by it.
-        requested = str(resolution or "").strip().lower()
-        if requested and requested in _published_resolutions(entry):
-            payload["resolution"] = requested
+        payload: Dict[str, Any] = {**fixed_fields, "image": image}
+        # Exact check on the serialized body the client will send (escapes included), so the
+        # cap holds even when the estimate above and reality drift apart.
+        if len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) > MAX_EDIT_PAYLOAD_BYTES:
+            return fail(
+                "Those reference images are too large to send "
+                f"(limit {MAX_EDIT_PAYLOAD_BYTES // (1024 * 1024)}MB including the prompt). "
+                "Use fewer or smaller images.", "invalid_input")
 
         headers = {"Authorization": f"Bearer {api_key}", "Accept": "application/json"}
         try:

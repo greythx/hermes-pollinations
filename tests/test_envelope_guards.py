@@ -144,6 +144,7 @@ def test_incomplete_source_image_rejected():
 
 def test_svg_output_rejected_t2i_and_edit():
     mod = _require()
+    _setup(mod)  # keyed state, so generation reaches the response checks standalone
     entry = {"name": "test/raster", "category": "image", "paid_only": False,
              "supported_endpoints": ["/v1/images/edits"],
              "pricing": {"currency": "pollen", "completionImageTokens": "0.002"}}

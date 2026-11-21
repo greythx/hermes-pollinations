@@ -203,20 +203,33 @@ def test_framing_reserve_counts_model_id():
     long_id = "x" * 4000
     entry = dict(QUEST, name=long_id, supported_endpoints=["/v1/images/edits"],
                  max_reference_images=4)
-    _setup(mod, catalog=[entry])
+    short_entry = dict(QUEST, name="ok/model", supported_endpoints=["/v1/images/edits"],
+                       max_reference_images=4)
+    _setup(mod, catalog=[entry, short_entry])
     posted = []
     setattr(mod, "_to_data_url", lambda v, limit=1000000: "data:image/png;base64," + "A" * 400)
     setattr(mod, "_http_post_json",
             lambda url, *, headers, payload, timeout=120.0: posted.append(payload) or {
                 "data": [{"b64_json": base64.b64encode(_png(1, 1)).decode()}]})
-    # A prompt sized so the OLD overhead (prompt+1024) fit the budget but the serialized
-    # body with the 4000-char model id does not: the call must be refused pre-POST.
-    budget = mod.MAX_EDIT_PAYLOAD_BYTES
-    prompt_len = budget - 1024 - 600  # old-overhead fit with ~600B of image framing
-    res = mod.PollinationsImageGenProvider().generate(
-        "p" * prompt_len, model=long_id, image_url="https://example.com/a.png")
-    assert res["success"] is False, res
-    assert posted == [], posted
+    # Scoped budget + a prompt UNDER the 32000-char cap, so the model-id overhead is what
+    # pushes the serialized body over the limit (with the real 40MiB budget the prompt-length
+    # gate fired first and this test never reached the budget check).
+    orig_budget = mod.MAX_EDIT_PAYLOAD_BYTES
+    setattr(mod, "MAX_EDIT_PAYLOAD_BYTES", 25000)
+    try:
+        prompt = "p" * 22000
+        res = mod.PollinationsImageGenProvider().generate(
+            prompt, model=long_id, image_url="https://example.com/a.png")
+        assert res["success"] is False, res
+        assert "too large" in res["error"], res
+        assert posted == [], posted
+        # Control: a short model id with the same prompt and image fits and posts.
+        res2 = mod.PollinationsImageGenProvider().generate(
+            prompt, model="ok/model", image_url="https://example.com/a.png")
+        assert res2["success"] is True, res2
+        assert len(posted) == 1
+    finally:
+        setattr(mod, "MAX_EDIT_PAYLOAD_BYTES", orig_budget)
 
 
 def test_svg_product_refused_before_spend():
