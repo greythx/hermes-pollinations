@@ -166,7 +166,10 @@ def test_payload_rejected_when_budget_exhausted():
     mod = _require()
     _edit_setup(mod)
     setattr(mod, "MAX_INPUT_IMAGE_BYTES", 1000)
-    setattr(mod, "MAX_EDIT_PAYLOAD_BYTES", 2500)
+    # Sized against the SERIALIZED fixed-field overhead (~120B): the first source encodes at
+    # the 1000B input cap, the second's remaining budget is below the minimum source size,
+    # so it is refused BEFORE encoding.
+    setattr(mod, "MAX_EDIT_PAYLOAD_BYTES", 1600)
     calls = []
 
     def _encode(value, limit=1000):
@@ -209,8 +212,9 @@ def test_prompt_counted_against_payload_cap():
     setattr(mod, "MAX_EDIT_PAYLOAD_BYTES", 2000)
     calls = []
     setattr(mod, "_to_data_url", lambda v, limit=1000000: calls.append(v) or "data:image/png;base64,AAAA")
+    # 1900 prompt bytes + serialized framing exceed the 2000B cap before any source is read.
     res = mod.PollinationsImageGenProvider().generate(
-        "x" * 1500, model="test/edit-model", image_url="https://example.com/a.png")
+        "x" * 1900, model="test/edit-model", image_url="https://example.com/a.png")
     assert res["success"] is False, res
     assert res["error_type"] == "invalid_input", res
     assert calls == [], calls

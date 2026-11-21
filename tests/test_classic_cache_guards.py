@@ -87,8 +87,8 @@ def _setup(mod, *, key=None, catalog=None, classic=None):
 
     setattr(mod, "_http_get_bytes", _no_get)
     setattr(mod, "_http_get_image", _no_get)
-    mod._CATALOG_CACHE.update({"negative_until": 0.0, "last_success": 0.0})
-    mod._CLASSIC_CACHE.update({"at": 0.0, "ids": [], "negative_until": 0.0, "last_success": 0.0})
+    mod._catalog_state().update({"negative_until": 0.0, "last_success": 0.0})
+    mod._classic_state().update({"at": 0.0, "ids": [], "negative_until": 0.0, "last_success": 0.0})
 
 
 def _jpeg_bytes(w: int, h: int) -> bytes:
@@ -102,8 +102,8 @@ def _jpeg_bytes(w: int, h: int) -> bytes:
 def test_failure_with_stale_cache_sets_negative_window():
     mod = _require()
     _setup(mod)
-    mod._store_classic_cache(["sana"])
-    mod._CLASSIC_CACHE.update({"at": 0.0, "ids": [], "negative_until": 0.0, "last_success": 0.0})
+    mod._store_classic_cache(["sana"], time.time())
+    mod._classic_state().update({"at": 0.0, "ids": [], "negative_until": 0.0, "last_success": 0.0})
     attempts = {"n": 0}
 
     def down(url, timeout=30.0):
@@ -114,26 +114,26 @@ def test_failure_with_stale_cache_sets_negative_window():
     for _ in range(5):
         assert mod._classic_models() == ["sana"]
     assert attempts["n"] == 1, attempts
-    assert mod._CLASSIC_CACHE["negative_until"] > time.time()
+    assert mod._classic_state()["negative_until"] > time.monotonic()
 
 
 def test_zero_valid_ids_preserves_cache():
     mod = _require()
     _setup(mod)
-    mod._store_classic_cache(["sana"])
-    mod._CLASSIC_CACHE.update({"at": 0.0, "ids": [], "negative_until": 0.0, "last_success": 0.0})
+    mod._store_classic_cache(["sana"], time.time())
+    mod._classic_state().update({"at": 0.0, "ids": [], "negative_until": 0.0, "last_success": 0.0})
     setattr(mod, "_http_get_json", lambda url, timeout=30.0: [{"name": "sana"}])
     assert mod._classic_models() == ["sana"]
     disk = json.loads((SCRATCH / "classic.json").read_text())
     assert disk["ids"] == ["sana"], disk
-    assert mod._CLASSIC_CACHE["negative_until"] > time.time()
+    assert mod._classic_state()["negative_until"] > time.monotonic()
 
 
 def test_decoy_nonmodel_list_preserves_cache():
     mod = _require()
     _setup(mod)
-    mod._store_classic_cache(["sana"])
-    mod._CLASSIC_CACHE.update({"at": 0.0, "ids": [], "negative_until": 0.0, "last_success": 0.0})
+    mod._store_classic_cache(["sana"], time.time())
+    mod._classic_state().update({"at": 0.0, "ids": [], "negative_until": 0.0, "last_success": 0.0})
     setattr(mod, "_http_get_json", lambda url, timeout=30.0: {"data": [{"v": 1}]})
     assert mod._classic_models() == ["sana"]
     disk = json.loads((SCRATCH / "classic.json").read_text())
@@ -143,8 +143,8 @@ def test_decoy_nonmodel_list_preserves_cache():
 def test_truly_empty_list_stays_authoritative():
     mod = _require()
     _setup(mod)
-    mod._store_classic_cache(["sana"])
-    mod._CLASSIC_CACHE.update({"at": 0.0, "ids": [], "negative_until": 0.0, "last_success": 0.0})
+    mod._store_classic_cache(["sana"], time.time())
+    mod._classic_state().update({"at": 0.0, "ids": [], "negative_until": 0.0, "last_success": 0.0})
     setattr(mod, "_http_get_json", lambda url, timeout=30.0: [])
     assert mod._classic_models() == []
     disk = json.loads((SCRATCH / "classic.json").read_text())

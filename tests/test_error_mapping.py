@@ -136,7 +136,7 @@ def test_sk_401_keeps_key_guidance():
 def test_error_fields_extracts_code_and_message():
     mod = _require()
     body = json.dumps({"error": {"code": "BAD_REQUEST", "message": "bad model"}}).encode()
-    code, preview = mod._error_fields(_FakeResponse(body))
+    code, preview, _fix = mod._error_fields(_FakeResponse(body))
     assert code == "BAD_REQUEST", code
     assert preview == "bad model", preview
 
@@ -147,7 +147,7 @@ def test_body_preview_long_json_extracts_message_only():
                "error": {"message": "m" * 600}}
     body = json.dumps(payload).encode()
     assert len(body) > 500
-    _, preview = mod._error_fields(_FakeResponse(body))
+    _, preview, _fix = mod._error_fields(_FakeResponse(body))
     assert "SUPER_SECRET" not in preview and "sig=" not in preview, preview
     assert preview.startswith("mmm"), preview
     assert len(preview) <= 200, len(preview)
@@ -156,7 +156,7 @@ def test_body_preview_long_json_extracts_message_only():
 def test_body_preview_non_json_redacts_urls():
     mod = _require()
     body = b"failed see https://cdn.example/x?sig=SECRET now"
-    _, preview = mod._error_fields(_FakeResponse(body))
+    _, preview, _fix = mod._error_fields(_FakeResponse(body))
     assert "SECRET" not in preview, preview
     assert "https://" not in preview, preview
 
@@ -164,14 +164,14 @@ def test_body_preview_non_json_redacts_urls():
 def test_body_preview_strips_control_chars():
     mod = _require()
     body = json.dumps({"error": {"message": "bad\x00\x1bmodel\nhere"}}).encode()
-    _, preview = mod._error_fields(_FakeResponse(body))
+    _, preview, _fix = mod._error_fields(_FakeResponse(body))
     assert "\x00" not in preview and "\x1b" not in preview and "\n" not in preview, preview
 
 
 def test_binary_error_body_not_echoed():
     mod = _require()
     jpeg = b"\xff\xd8\xff\xe0" + b"\x00" * 100 + b"\xff\xd9"
-    code, preview = mod._error_fields(_FakeResponse(jpeg))
+    code, preview, _fix = mod._error_fields(_FakeResponse(jpeg))
     assert code is None, code
     assert preview == "(non-text error body)", preview
 
@@ -218,10 +218,13 @@ def test_oversize_error_body_preserves_status_mapping():
 
 def test_oversize_non_json_error_body_redacts_urls():
     mod = _require()
-    body = ("upstream failure " + "x" * (100 * 1024)
-            + " https://cdn.example/img?sig=SUPERSECRET").encode()
-    code, preview = mod._error_fields(_FakeResponse(body))
+    # The URL must sit INSIDE the 64KiB prefix _error_fields reads, or the test passes
+    # vacuously (truncation hides the secret even with redaction deleted).
+    body = ("upstream failure https://cdn.example/img?sig=SUPERSECRET "
+            + "x" * (100 * 1024)).encode()
+    code, preview, _fix = mod._error_fields(_FakeResponse(body))
     assert "SUPERSECRET" not in preview, preview
+    assert "[url]" in preview, preview
     assert len(preview) <= 200, len(preview)
 
 
@@ -232,7 +235,7 @@ def test_escaped_signed_url_redacted_in_truncated_body():
     # prefix so the fallback actually sees it.
     body = ('{"url": "https:\\/\\/cdn.example\\/img?sig=SUPERSECRET", '
             '"error": {"message": "' + "x" * 70000 + '"}}').encode()
-    code, preview = mod._error_fields(_FakeResponse(body))
+    code, preview, _fix = mod._error_fields(_FakeResponse(body))
     assert "SUPERSECRET" not in preview, preview
     assert "cdn.example" not in preview, preview
 
@@ -240,7 +243,7 @@ def test_escaped_signed_url_redacted_in_truncated_body():
 def test_escaped_signed_url_redacted_in_short_invalid_body():
     mod = _require()
     body = b"not json at all https:\\/\\/cdn.example\\/img?sig=SUPERSECRET tail"
-    code, preview = mod._error_fields(_FakeResponse(body))
+    code, preview, _fix = mod._error_fields(_FakeResponse(body))
     assert "SUPERSECRET" not in preview, preview
     assert "cdn.example" not in preview, preview
 
@@ -250,17 +253,17 @@ def test_escaped_url_redacted_in_valid_json_without_message():
     # Parses fine but carries no error.message: the fallback sees the RAW text, where the
     # slashes are still escaped (plain and \\u002f forms).
     body = b'{"url": "https:\\/\\/cdn.example\\/img?sig=SUPERSECRET", "code": 400}'
-    code, preview = mod._error_fields(_FakeResponse(body))
+    code, preview, _fix = mod._error_fields(_FakeResponse(body))
     assert "SUPERSECRET" not in preview, preview
     body = b'{"url": "https:\\u002f\\u002fcdn.example\\/img?sig=SUPERSECRET"}'
-    code, preview = mod._error_fields(_FakeResponse(body))
+    code, preview, _fix = mod._error_fields(_FakeResponse(body))
     assert "SUPERSECRET" not in preview, preview
 
 
 def test_signed_url_inside_error_message_redacted():
     mod = _require()
     body = json.dumps({"error": {"message": "fetch failed https://cdn.example/img?sig=SUPERSECRET"}}).encode()
-    code, preview = mod._error_fields(_FakeResponse(body))
+    code, preview, _fix = mod._error_fields(_FakeResponse(body))
     assert "SUPERSECRET" not in preview, preview
     assert "fetch failed" in preview, preview
 
@@ -284,7 +287,7 @@ def test_double_escaped_urls_redacted():
         b"not json https:" + dbl + b"/" + b"\\/" + b"cdn.example/img?sig=MIXED tail",
     ]
     for body in bodies:
-        _, preview = mod._error_fields(_RawBodyResponse(body))
+        _, preview, _fix = mod._error_fields(_RawBodyResponse(body))
         assert "[url]" in preview, preview
         for secret in ("DOUBLE", "UNI", "MIXED"):
             assert secret not in preview, preview

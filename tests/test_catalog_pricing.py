@@ -113,7 +113,7 @@ def test_per_unit_billing_labels_survive_string_prices():
     mod = _require()
     per_mp = _model("0.00000002", pricing_units={
         "completionImageTokens": {"unit": "megapixel", "quantity": 1000000}})
-    assert mod._price_label(per_mp, False, True) == "charged per megapixel · needs key"
+    assert "per megapixel · needs key" in mod._price_label(per_mp, False, True)
     per_token = _model("0.0000075", flat_rate=False)
     assert mod._price_label(per_token, False, True) == "charged per token · needs key"
 

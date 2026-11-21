@@ -33,15 +33,19 @@ reached the plugin skips its client-side pre-checks and lets the server enforce 
 
 Selection: ``model`` kwarg → ``POLLINATIONS_IMAGE_MODEL`` → ``image_gen.pollinations.model``
 → ``image_gen.model`` → the free classic model, else the first Quest-eligible one. Catalog ids
-*and* aliases resolve; an unknown id passes through verbatim, so a model added upstream works
-the day it appears.
+*and* aliases resolve case-insensitively (the catalog's own spelling is restored). An unknown
+id set explicitly, via ``POLLINATIONS_IMAGE_MODEL`` or ``image_gen.pollinations.model`` passes
+through verbatim, so a model added upstream works the day it appears; an unknown shared
+``image_gen.model`` value falls back to the live default instead (usually another provider's
+leftover id), unless the free classic API serves it.
 
 Picker visibility follows the credentials, so the list never offers a model the current setup
 cannot run: no key → the models the free classic API serves (usually one); a key → every
 Quest-eligible model; a key plus the ``include_paid_models`` setting (Desktop → Settings →
 Plugins) → the paid-only catalog too. The setting also gates invocation: a paid-only catalog
-model is refused while it is off, whichever path selected it. The user's saved model is always
-kept visible, so neither change makes it vanish. Rows are ordered by estimated per-image cost:
+model is refused while it is off, whichever path selected it. The user's saved model is kept
+visible whenever the current state can run it (a keyed passthrough id gets a minimal row, and
+a retained paid row is marked disabled), so neither change makes it vanish silently. Rows are ordered by estimated per-image cost:
 per-image and per-megapixel rates are normalized, per-token models follow them, and unpublished
 prices sort last; keyless, the free classic rows lead regardless of any enter price.
 
@@ -65,6 +69,7 @@ import random
 import re
 import threading
 import time
+import unicodedata
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -82,12 +87,13 @@ from agent.image_gen_provider import (
 from plugins.image_gen._common import (
     api_key_setup_schema, cache_url_best_effort, catalog_rows, collect_source_images,
     error_factory, load_image_gen_config, record_token_usage)
+from hermes_constants import mkdir_under_hermes_home
 from utils import atomic_json_write, read_json_or_empty
 
 logger = logging.getLogger(__name__)
 
-# Warn once per process about an unscoped secret read (see _api_key).
-_UNSCOPED_WARNED = False
+# Warn once per Hermes home about an unscoped secret read (see _api_key).
+_UNSCOPED_WARNED_HOMES: set = set()
 
 CATALOG_URL = "https://gen.pollinations.ai/image/models"
 CLASSIC_MODELS_URL = "https://image.pollinations.ai/models"
@@ -116,7 +122,9 @@ SPEC_TTL = 86400
 HTTP_TIMEOUT = 120.0
 
 # Source images are inlined into the edits payload as data URIs, so they are capped before the
-# base64 blow-up and restricted to formats every image model accepts.
+# base64 blow-up; the format list is a conservative client allowlist of common raster formats
+# (the spec publishes no input-format contract). The same raster allowlist gates generated
+# output (SVG and other active formats are refused).
 MAX_INPUT_IMAGE_BYTES = 25 * 1024 * 1024
 ACCEPTED_INPUT_MIME = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"})
 # Hermes' resolution creative control can only express these two values.
@@ -147,6 +155,9 @@ NEGATIVE_TTL = 60.0
 # a safe default within the current spec, not a claim about it. Caller seeds are validated
 # against the range read live from the published OpenAPI spec.
 _RANDOM_SEED_MAX = 2**31 - 1
+# Client sanity ceiling: a hostile/absurd published range must not put 400-digit seeds into
+# URLs; the live range stays authoritative within sane bounds.
+_SEED_SANITY_MAX = 2**63 - 1
 # Picker column widths: strengths is truncated to keep the row readable.
 STRENGTHS_LIMIT = 120
 # How many edit-capable models an error message names.
@@ -155,8 +166,10 @@ EDIT_HINT_MODELS = 3
 # trusted, so a shape change upstream cannot silently mislabel rows.
 CACHE_SCHEMA = 1
 
-# Semantic aspect -> pixel size; satisfies every per-model size constraint the spec currently
-# publishes. The free classic route keeps the aspect ratio within its own smaller area cap.
+# Semantic aspect -> pixel size. Verified at authoring time against every per-model size
+# constraint the spec publishes in prose (no machine-readable per-model constraints exist);
+# re-verify when the spec changes. The free classic route keeps the aspect ratio within its
+# own smaller area cap.
 SIZES: Dict[str, tuple[int, int]] = {
     "landscape": (1280, 768),
     "square": (1024, 1024),
@@ -194,13 +207,14 @@ def _api_key() -> Optional[str]:
 
     for name in API_KEY_ENVS:
         try:
-            value = str(get_secret(name) or "").strip()
+            secret = get_secret(name)
+            value = secret.strip() if isinstance(secret, str) else ""
         except UnscopedSecretError:
             # Deliberate keyless degradation, but under multiplexing this can also mean a
             # spawn-site scoping bug: warn once so it is visible, then stay quiet.
-            global _UNSCOPED_WARNED
-            if not _UNSCOPED_WARNED:
-                _UNSCOPED_WARNED = True
+            home = _home_key()
+            if home not in _UNSCOPED_WARNED_HOMES:
+                _UNSCOPED_WARNED_HOMES.add(home)
                 logger.warning("No secret scope bound for %s; treating it as unset. Under "
                                "multiplexing this can indicate a scoping bug at the spawn site.",
                                name)
@@ -215,6 +229,23 @@ def _api_key() -> Optional[str]:
         if value:
             return value
     return None
+
+
+def _model_env() -> str:
+    """The profile-scoped model override.
+
+    get_secret honours the routed profile and falls through to os.environ single-profile, so
+    a launch-profile POLLINATIONS_IMAGE_MODEL no longer leaks into a routed profile.
+    """
+    from agent.secret_scope import UnscopedSecretError, get_secret
+
+    try:
+        return str(get_secret(MODEL_ENV) or "").strip()
+    except UnscopedSecretError:
+        return ""
+    except Exception as exc:
+        logger.debug("Could not read %s from the secret backend: %s", MODEL_ENV, exc)
+        return ""
 
 
 def _hermes_home() -> Path:
@@ -261,11 +292,16 @@ def _ssrf_client(timeout: float, *, follow_redirects: bool = True) -> Any:
     return create_ssrf_safe_client(timeout=timeout, follow_redirects=follow_redirects)
 
 
-def _unwrap_list(payload: Any, keys: tuple) -> Optional[List[Any]]:
+def _unwrap_list(payload: Any, keys: tuple, *,
+                 fallback_item_ok: Optional[Callable[[List[Any]], bool]] = None,
+                 fallback_key_ok: Optional[Callable[[str], bool]] = None) -> Optional[List[Any]]:
     """The first list a JSON envelope carries, preferring the named keys.
 
     Third-party envelopes rename their fields, and a rename must not read as an empty response.
     One level of nesting is followed, so ``{"data": {"models": [...]}}`` resolves too.
+    The positional fallback is additionally gated by the caller's shape predicates, so a
+    name-shaped non-model list (``tags: [{name: "nsfw"}]``) cannot pose as the catalog and a
+    classic envelope must name a models-like key.
     """
     if isinstance(payload, list):
         return payload
@@ -275,22 +311,32 @@ def _unwrap_list(payload: Any, keys: tuple) -> Optional[List[Any]]:
             if isinstance(value, list):
                 return value
             if isinstance(value, dict):
-                inner = _unwrap_list(value, keys)
+                inner = _unwrap_list(value, keys, fallback_item_ok=fallback_item_ok,
+                                     fallback_key_ok=fallback_key_ok)
                 if inner is not None:
                     return inner
         # Positional fallback for a renamed envelope: skip well-known non-model lists and prefer
         # the first model-shaped list, so an "errors" array cannot pose as the catalog.
         fallback: Optional[List[Any]] = None
+        candidates = 0
         for key, value in payload.items():
             if key in ("errors", "warnings", "messages") or not isinstance(value, list):
                 continue
+            if fallback_key_ok is not None and not fallback_key_ok(key):
+                continue
+            candidates += 1
             if fallback is None:
                 fallback = value
             if any(isinstance(item, dict)
                    and (_valid_id(item.get("name")) or _valid_id(item.get("id")))
                    for item in value):
-                return value
-        if fallback is not None:
+                if fallback_item_ok is None or fallback_item_ok(value):
+                    return value
+        # Several qualifying lists with no model-shaped items are AMBIGUOUS: choosing by key
+        # order could cache a version list as the model list. Treat it as a failed fetch so
+        # the caller's last-good cache survives.
+        if (fallback is not None and candidates == 1
+                and (fallback_item_ok is None or fallback_item_ok(fallback))):
             return fallback
     return None
 
@@ -321,27 +367,33 @@ class _HTTPError(Exception):
 
     def __init__(self, url: str, status: int, body: str = "",
                  retry_after: Optional[int] = None,
-                 error_code: Optional[str] = None) -> None:
+                 error_code: Optional[str] = None,
+                 fix_url: Optional[str] = None) -> None:
         super().__init__(f"HTTP {status} from {url}")
         self.url = url
         self.status = status
         self.body = body
         self.retry_after = retry_after
         self.error_code = error_code
+        self.fix_url = fix_url
 
 
 def _retry_after(response: Any) -> Optional[int]:
     """The ``Retry-After`` header in seconds, as a delay or an HTTP-date."""
     raw = (response.headers.get("retry-after") or "").strip()
     try:
-        return max(0, int(float(raw)))
+        # ASCII decimal shape only, mirroring the price parser: float() alone would read
+        # '1_0' and non-ASCII digits as delays.
+        if not re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", raw, re.ASCII):
+            raise ValueError(raw)
+        return min(RETRY_AFTER_MAX, max(0, int(float(raw))))
     except (TypeError, ValueError, OverflowError):
         pass
     try:
         from email.utils import parsedate_to_datetime
 
         delta = parsedate_to_datetime(raw) - datetime.now(timezone.utc)
-        return max(0, int(delta.total_seconds()))
+        return min(RETRY_AFTER_MAX, max(0, int(delta.total_seconds())))
     except Exception:
         return None
 
@@ -366,29 +418,71 @@ def _read_prefix(response: Any, limit: int) -> bytes:
     return b"".join(chunks)
 
 
-# URLs in raw error text can be JSON-escaped (https:\/\/ or https:\/), and a JSON string
-# embedded in another JSON string doubles the backslashes (https:\\/\\/). The redaction
-# matches any number of backslashes before each slash (or \u002f spell), and stops at
-# whitespace or a quote so a compact JSON body does not redact past the string it is in.
-_URL_SLASH = r"(?:\\*/|\\*u002[fF])"
-_URL_RE = re.compile(r"https?:" + _URL_SLASH + r"{2}[^\s\"']*", re.IGNORECASE)
+# URLs in raw error text can be JSON-escaped (https:\/\/), double-escaped, or unicode-
+# escaped in ANY scheme character (\u0068ttps\u003a//). _redact_urls decodes those spellings
+# (bounded passes), strips control characters that could split a URL, then matches http(s)
+# and protocol-relative // URLs whose tail allows apostrophes and stops at whitespace,
+# double quotes and backslashes; bare credential query tails are masked separately.
+# Backslash runs are bounded: an unbounded \\+ backtracks O(n^2) on a hostile 64KB
+# backslash flood (~26s). Realistic JSON escape nesting needs only a few per layer.
+_ESCAPE_RE = re.compile(r"\\{1,8}u([0-9a-fA-F]{4})|\\{1,8}(/)")
+_URL_RE = re.compile(r"(?:https?:)?//[^\s\"\\]*", re.IGNORECASE)
+_SECRET_TAIL_RE = re.compile(
+    r"([#?&](?:sig|signature|token|access_token|accessToken|access-token|api_key|api-key|apikey|"
+    r"key|password|secret|auth|credential|client_secret|refresh_token|policy|key-pair-id|code|"
+    r"session|sid|jwt|bearer|x-amz-[a-z0-9-]+|x-goog-[a-z0-9-]+)=)"
+    r"[^\s\"&\\]*", re.IGNORECASE)
+# Display clamp for an absurd Retry-After, not an API fact.
+RETRY_AFTER_MAX = 86400
 
 
-def _error_fields(response: Any) -> tuple[Optional[str], str]:
-    """The upstream error code and a short, control-character-free preview, safe for the agent.
+def _unescape_match(match: Any) -> str:
+    if match.group(2) is not None:
+        return "/"
+    cp = int(match.group(1), 16)
+    if 0xD800 <= cp <= 0xDFFF:
+        return ""  # a lone surrogate is not displayable text
+    return chr(cp)
 
-    The FULL bounded body is parsed before any truncation: cutting first would break json.loads
-    on a long body and leak sibling fields (such as signed URLs) through the raw-text fallback.
+
+def _redact_urls(text: str) -> str:
+    """Decode escape spellings, then redact URLs and bare credential query tails.
+
+    Shared by the HTTP-error and in-band 200 edit-error paths so no path can leak a signed
+    URL. Control characters are removed BEFORE matching (one hidden inside a URL must not
+    split it into unrecognizable halves); the preview shows the decoded, redacted text.
+    """
+    prev = None
+    for _ in range(6):
+        if text == prev:
+            break
+        prev = text
+        text = _ESCAPE_RE.sub(_unescape_match, text)
+    # Browsers normalize a single-slash https:/host to https://host; match that shape too.
+    text = re.sub(r"(https?:)/(?!/)", r"\1//", text)
+    text = "".join(ch for ch in text if ch.isprintable() or ch in " \t")
+    text = _URL_RE.sub("[url]", text)
+    return _SECRET_TAIL_RE.sub(r"\1[redacted]", text)
+
+
+def _error_fields(response: Any) -> tuple[Optional[str], str, Optional[str]]:
+    """The upstream error code, a short redacted preview, and the published fixUrl (if any).
+
+    The 64KB bounded prefix is parsed before the 200-char preview cut; oversized bodies fall
+    back to URL-redacted raw text (a signed URL must never reach the preview on ANY path).
     A JSON error body is reduced to its ``error.message``; anything else has its URLs redacted.
+    fixUrl is read live from the envelope (the spec publishes it per error) so guidance can
+    point at the upstream fix page instead of a hardcoded constant.
     """
     raw_bytes = _read_prefix(response, 64 * 1024)
     if _sniff_image_mime(raw_bytes) is not None:
         # An error status can carry an image body (the classic route does this when unhealthy);
         # never echo binary garbage into the agent-visible preview.
-        return None, "(non-text error body)"
+        return None, "(non-text error body)", None
     raw = raw_bytes.decode("utf-8", "replace")
     code: Optional[str] = None
     message: Optional[str] = None
+    fix_url: Optional[str] = None
     try:
         payload = json.loads(raw)
     except Exception:
@@ -400,15 +494,27 @@ def _error_fields(response: Any) -> tuple[Optional[str], str]:
                 code = err["code"]
             if isinstance(err.get("message"), str):
                 message = err["message"]
+            candidate = err.get("fixUrl")
+            if (isinstance(candidate, str) and candidate.startswith("https://")
+                    and len(candidate) <= 2048 and candidate.isprintable()
+                    and not any(ch.isspace() for ch in candidate)
+                    and "\\" not in candidate):  # browsers read \\ as / in the authority
+                # Guidance, not payload: drop query/fragment (credential tails) and reject
+                # userinfo so nothing sensitive or injectable reaches the agent-visible error.
+                base = candidate.split("?", 1)[0].split("#", 1)[0]
+                authority = base[len("https://"):].split("/", 1)[0]
+                # ASCII-only authority: UTS46 maps fullwidth ＼/﹨/＠ to \/@, which browsers
+                # read as authority separators (host spoofing). Legitimate fix hosts are ASCII.
+                if "@" not in authority and authority.isascii():
+                    fix_url = base
         elif isinstance(err, str):
             message = err
     if message is None:
         message = raw
     # Redact on EVERY path (extracted message included): a signed URL must never reach the
-    # agent-visible preview, in plain or JSON-escaped form, before the 200-character cut.
-    message = _URL_RE.sub("[url]", message)
-    preview = "".join(ch for ch in message if ch.isprintable() or ch in " \t").strip()[:200]
-    return code, preview
+    # agent-visible preview, in plain, JSON-escaped or unicode-escaped form, before the cut.
+    preview = _redact_urls(message).strip()[:200]
+    return code, preview, fix_url
 
 
 def _network_error_type(exc: Exception) -> str:
@@ -438,6 +544,8 @@ def _request_failed(exc: Exception, *, action: str, mode: str = "quest",
         # Paid-Pollen restriction) and 429 alone is the rate limit. The free-route wording must
         # say "rate-limited": the core's guardrail classifier reads the error TEXT, not error_type.
         detail = f": {exc.body}" if exc.body else ""
+        if exc.fix_url:
+            detail += f" — fix: {exc.fix_url}"
         if exc.status == 401:
             if mode == "free":
                 return fail(
@@ -459,11 +567,18 @@ def _request_failed(exc: Exception, *, action: str, mode: str = "quest",
                     f"Pollinations returned HTTP 402{wait}{detail} — the free classic route is "
                     "rate-limited per IP. Wait, or add POLLINATIONS_API_KEY to skip the throttle.",
                     "rate_limited")
-            if exc.error_code in ("QUEST_POLLEN_ONLY", "QUEST_POLLEN_RESTRICTED"):
+            if exc.error_code == "QUEST_POLLEN_ONLY":
                 return fail(
                     f"Pollinations returned HTTP 402{detail} — this model needs Paid Pollen. "
                     "Pick a Quest-eligible model, or enable 'Include paid models' with a paid "
                     "balance at https://enter.pollinations.ai.", "payment_required")
+            if exc.error_code == "QUEST_POLLEN_RESTRICTED":
+                # The spec publishes this code but documents no prose meaning; word neutrally.
+                return fail(
+                    f"Pollinations returned HTTP 402{detail} — this model is restricted for "
+                    "your key; it may need Paid Pollen or a key permission change. Pick a "
+                    "Quest-eligible model, or check the account at "
+                    "https://enter.pollinations.ai.", "payment_required")
             balance = "Paid Pollen" if mode == "paid" else "Quest Pollen"
             return fail(
                 f"Pollinations returned HTTP 402{detail} — usually the {balance} balance or the "
@@ -479,6 +594,17 @@ def _request_failed(exc: Exception, *, action: str, mode: str = "quest",
                 f"Pollinations returned HTTP 429{wait}{detail} — rate limit reached. Wait for "
                 "the retry window, or check the account at https://enter.pollinations.ai.",
                 "rate_limited")
+        if exc.status == 403:
+            if mode == "free":
+                # No key was sent on the classic route: do not blame key permissions.
+                return fail(
+                    f"Pollinations returned HTTP 403{detail} — the free classic API refused "
+                    "this anonymous request. Try again later, or pick another model.",
+                    "api_error")
+            return fail(
+                f"Pollinations returned HTTP 403{detail} — the key lacks permission for this "
+                "model or operation. Check the account and key permissions at "
+                "https://enter.pollinations.ai, or pick another model.", "auth_required")
         return fail(f"Pollinations returned HTTP {exc.status}{detail}", "api_error")
     logger.debug("Pollinations %s (%s) failed", action, mode, exc_info=True)
     # The raw exception can carry a URL with signed query parameters or a parser's wording, so
@@ -494,9 +620,9 @@ def _http_get_bytes(url: str, *, headers: Optional[Dict[str, str]] = None,
     with _ssrf_client(timeout) as client:
         with client.stream("GET", url, headers=headers or {}) as response:
             if response.status_code >= 400:
-                code, preview = _error_fields(response)
+                code, preview, fix_url = _error_fields(response)
                 raise _HTTPError(url, response.status_code, preview,
-                                 _retry_after(response), error_code=code)
+                                 _retry_after(response), error_code=code, fix_url=fix_url)
             return _bounded_read(response, url)
 
 
@@ -511,10 +637,12 @@ def _http_post_json(url: str, *, headers: Dict[str, str], payload: Dict[str, Any
     """
     with _ssrf_client(timeout, follow_redirects=False) as client:
         with client.stream("POST", url, headers=headers, json=payload) as response:
-            if response.status_code >= 400:
-                code, preview = _error_fields(response)
+            # Redirects are not followed, so ANY 3xx is terminal: a redirect carrying a JSON
+            # body must not parse as a completed edit.
+            if response.status_code >= 300:
+                code, preview, fix_url = _error_fields(response)
                 raise _HTTPError(url, response.status_code, preview,
-                                 _retry_after(response), error_code=code)
+                                 _retry_after(response), error_code=code, fix_url=fix_url)
             return json.loads(_bounded_read(response, url))
 
 
@@ -569,6 +697,60 @@ def _jpeg_dimensions(raw: bytes) -> Optional[tuple[int, int]]:
     return None
 
 
+def _png_dimensions(raw: bytes) -> Optional[tuple[int, int]]:
+    """Pixel size from a PNG's IHDR (width/height are the first 8 bytes of chunk data)."""
+    if len(raw) < 24 or raw[:8] != b"\x89PNG\r\n\x1a\n" or raw[12:16] != b"IHDR":
+        return None
+    width = int.from_bytes(raw[16:20], "big")
+    height = int.from_bytes(raw[20:24], "big")
+    return (width, height) if width > 0 and height > 0 else None
+
+
+def _gif_dimensions(raw: bytes) -> Optional[tuple[int, int]]:
+    """Pixel size from a GIF's logical screen descriptor (little-endian, bytes 6..10)."""
+    if len(raw) < 10 or raw[:6] not in (b"GIF87a", b"GIF89a"):
+        return None
+    width = int.from_bytes(raw[6:8], "little")
+    height = int.from_bytes(raw[8:10], "little")
+    return (width, height) if width > 0 and height > 0 else None
+
+
+def _webp_dimensions(raw: bytes) -> Optional[tuple[int, int]]:
+    """Pixel size from a WebP's first chunk (VP8X canvas, VP8L packed bits, or VP8 frame)."""
+    if len(raw) < 20 or raw[:4] != b"RIFF" or raw[8:12] != b"WEBP":
+        return None
+    chunk = raw[12:16]
+    if chunk == b"VP8X" and len(raw) >= 30:
+        return (int.from_bytes(raw[24:27], "little") + 1,
+                int.from_bytes(raw[27:30], "little") + 1)
+    if chunk == b"VP8L" and len(raw) >= 25 and raw[20] == 0x2F:
+        bits = int.from_bytes(raw[21:25], "little")
+        return ((bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1)
+    if chunk == b"VP8 " and len(raw) >= 30 and raw[23:26] == b"\x9d\x01\x2a":
+        width = int.from_bytes(raw[26:28], "little") & 0x3FFF
+        height = int.from_bytes(raw[28:30], "little") & 0x3FFF
+        return (width, height) if width > 0 and height > 0 else None
+    return None
+
+
+def _image_dimensions(raw: bytes, mime: Optional[str]) -> Optional[tuple[int, int]]:
+    """Produced pixel size measured structurally from decoded image bytes (no decode).
+
+    Used when the API does not announce the produced size: the classic route clamps silently,
+    and an edit may be resized server-side. None when unmeasurable; the caller keeps the
+    requested dimensions.
+    """
+    if mime == "image/jpeg":
+        return _jpeg_dimensions(raw)
+    if mime == "image/png":
+        return _png_dimensions(raw)
+    if mime == "image/gif":
+        return _gif_dimensions(raw)
+    if mime == "image/webp":
+        return _webp_dimensions(raw)
+    return None
+
+
 def _http_get_image(url: str, *, headers: Optional[Dict[str, str]] = None,
                     timeout: float = HTTP_TIMEOUT) -> tuple[bytes, Optional[tuple[int, int]]]:
     """GET an image through the SSRF guard, reporting the produced size when the API sends it.
@@ -579,9 +761,9 @@ def _http_get_image(url: str, *, headers: Optional[Dict[str, str]] = None,
     with _ssrf_client(timeout) as client:
         with client.stream("GET", url, headers=headers or {}) as response:
             if response.status_code >= 400:
-                code, preview = _error_fields(response)
+                code, preview, fix_url = _error_fields(response)
                 raise _HTTPError(url, response.status_code, preview,
-                                 _retry_after(response), error_code=code)
+                                 _retry_after(response), error_code=code, fix_url=fix_url)
             dims = _parse_image_dimensions(response.headers.get("x-image-dimensions"))
             return _bounded_read(response, url), dims
 
@@ -591,17 +773,20 @@ def _seed_from(kwargs: Dict[str, Any]) -> int:
 
     The range (including the -1 sentinel) is read from the published spec, so a widened or
     narrowed range follows upstream without a plugin edit; reproducible generations are
-    possible on models that honor seed. A bool is not a seed. Out-of-range or non-integer
+    possible on models that honor seed (direct provider calls only — the image_generate tool
+    exposes no seed parameter). A bool is not a seed. Out-of-range or non-integer
     values fall back to random instead of erroring. When the spec range is unknown the
-    caller's int passes through verbatim and the server validates it.
+    caller's int passes through verbatim and the server validates it. The -1 sentinel is
+    spec-valid on both routes ("random" on GET, the stable compatibility seed on edits) and
+    is forwarded verbatim.
     """
     raw = kwargs.get("seed")
     limits = _spec_limits()
     lo, hi = limits["seed_min"], limits["seed_max"]
     if isinstance(raw, int) and not isinstance(raw, bool):
-        if lo is None or hi is None or lo <= raw <= hi:
+        if (lo is None or hi is None or lo <= raw <= hi) and abs(raw) <= _SEED_SANITY_MAX:
             return raw
-    top = hi if hi is not None else _RANDOM_SEED_MAX
+    top = min(hi, _SEED_SANITY_MAX) if hi is not None else _RANDOM_SEED_MAX
     bottom = max(0, lo) if lo is not None else 0
     if bottom > top:
         # A negative-only published range cannot host a nonnegative random seed: return the
@@ -610,8 +795,20 @@ def _seed_from(kwargs: Dict[str, Any]) -> int:
     return random.randint(bottom, top)
 
 
-_CATALOG_CACHE: Dict[str, Any] = {"negative_until": 0.0, "last_success": 0.0}
+# Cache state is keyed by Hermes home: under multiplexing a routed profile must not inherit
+# another profile's failure window or success token. Locks stay global (cheap, short-held).
+# negative_until/last_success use the MONOTONIC clock (immune to wall-clock skew); disk
+# "fetched" and classic memory "at" stay wall-clock (they compare across processes).
+_CATALOG_STATES: Dict[str, Dict[str, Any]] = {}
 _CATALOG_LOCK = threading.Lock()
+
+
+def _home_key() -> str:
+    return str(_hermes_home())
+
+
+def _catalog_state() -> Dict[str, Any]:
+    return _CATALOG_STATES.setdefault(_home_key(), {"negative_until": 0.0, "last_success": 0.0})
 
 
 def _cache_schema_ok(raw: Dict[str, Any]) -> bool:
@@ -635,6 +832,75 @@ def _note_contract_gaps(models: List[Dict[str, Any]]) -> None:
         if not any(isinstance(m, dict) and field in m for m in models):
             logger.debug("Pollinations catalog publishes no %r field — possible upstream rename.",
                          field)
+
+
+def _unlink_planted_symlink(path: Path) -> None:
+    """Core atomic_replace preserves symlinks; a planted link in the cache dir would turn a
+    cache write into an arbitrary-file overwrite. Discard the link (the target is untouched)
+    so the write lands on a regular file. Best-effort against a local attacker already inside
+    the home-directory trust boundary."""
+    try:
+        if path.is_symlink():
+            path.unlink()
+    except OSError:
+        pass
+
+
+def _guarded_cache_write(path: Path, payload: Dict[str, Any], started: float) -> bool:
+    """Atomic cache write guarded against cross-process clobber (POSIX flock, best-effort).
+
+    Under the lock, re-read the disk timestamp: if another process wrote NEWER data while
+    this fetch was in flight, skip the write rather than overwrite it. The payload is stamped
+    with the fetch START, so a later-started fetch wins even when it completes last. On
+    platforms without fcntl (or any lock I/O error) the plain atomic write still applies.
+    Returns True when this payload was written, False when a newer disk write won.
+    """
+    try:
+        # Create the parent BEFORE the lock open: a missing dir would otherwise drop both
+        # first fetches into the unlocked fallback, skipping the ordering check. The
+        # tombstone-aware helper never recreates a deleted named profile home.
+        mkdir_under_hermes_home(path.parent)
+    except Exception:
+        return False
+    try:
+        import fcntl
+    except ImportError:
+        _unlink_planted_symlink(path)
+        atomic_json_write(path, payload)
+        return True
+    _unlink_planted_symlink(path)
+    lock_path = path.with_name(path.name + ".lock")
+    try:
+        # O_NOFOLLOW: a planted symlink lockfile must not create/lock an arbitrary target.
+        fd = os.open(lock_path, os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    except OSError:
+        fd = None
+    if fd is None:
+        atomic_json_write(path, payload)  # no lock available: best-effort write
+        return True
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            disk = read_json_or_empty(path)
+            try:
+                disk_fetched = float(disk.get("fetched") or 0)
+            except (TypeError, ValueError, OverflowError):
+                disk_fetched = 0.0  # a corrupt stamp must not immortalize the file
+            if not math.isfinite(disk_fetched):
+                disk_fetched = 0.0  # Infinity would block every later write
+            if disk_fetched > started:
+                return False  # a newer write landed mid-fetch
+            _unlink_planted_symlink(path)
+            atomic_json_write(path, payload)
+            return True
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        _unlink_planted_symlink(path)
+        atomic_json_write(path, payload)
+        return True
+    finally:
+        os.close(fd)
 
 
 def _catalog() -> List[Dict[str, Any]]:
@@ -661,14 +927,17 @@ def _catalog() -> List[Dict[str, Any]]:
     except Exception:
         pass
     with _CATALOG_LOCK:
-        if time.time() < float(_CATALOG_CACHE.get("negative_until") or 0.0):
+        if time.monotonic() < float(_catalog_state().get("negative_until") or 0.0):
             return cached if cached is not None else []
     # Only a fetch that began after the last successful one may record an outcome; otherwise a
     # slow failure would hide a cache another thread has already refreshed.
     started = time.time()
+    started_mono = time.monotonic()
     try:
-        models = _unwrap_list(_http_get_json(CATALOG_URL),
-                              ("models", "data", "items", "results")) or []
+        models = _unwrap_list(
+            _http_get_json(CATALOG_URL), ("models", "data", "items", "results"),
+            fallback_item_ok=lambda items: any(isinstance(it, dict) and _is_image_model(it)
+                                               for it in items)) or []
         # Drop non-object entries AND entries without a usable id at the source: a renamed
         # envelope can surface a list that is not models at all, and zero usable ids has the
         # same effect as an empty answer — it must not overwrite a good cache.
@@ -681,32 +950,36 @@ def _catalog() -> List[Dict[str, Any]]:
         with _CATALOG_LOCK:
             # Mirror the classic guard on SUCCESS too: a slow stale fetch must not overwrite a
             # newer cache another thread already wrote.
-            if started >= float(_CATALOG_CACHE.get("last_success") or 0.0):
+            if started_mono >= float(_catalog_state().get("last_success") or 0.0):
                 try:
-                    # Atomic replace: a concurrent reader must never see a half-written catalog.
-                    atomic_json_write(path, {"version": CACHE_SCHEMA, "fetched": time.time(),
-                                             "models": models})
+                    # Atomic replace, cross-process guarded, stamped with the fetch START.
+                    _guarded_cache_write(path, {"version": CACHE_SCHEMA, "fetched": started,
+                                                "models": models}, started)
                 except Exception as exc:
                     logger.debug("Could not cache Pollinations catalog: %s", exc)
-                _CATALOG_CACHE["negative_until"] = 0.0
+                _catalog_state()["negative_until"] = 0.0
                 # Record the fetch's START token, not its completion time: a later-started
                 # fetch carries newer data and must win even when it completes last.
-                _CATALOG_CACHE["last_success"] = started
+                _catalog_state()["last_success"] = started_mono
         return models
     except Exception as exc:
         logger.debug("Pollinations catalog fetch failed: %s", exc)
         # Remember the failure briefly, whether or not a stale cache exists: the cache still
         # wins, but a down endpoint must cost one timeout per window rather than one per call.
         with _CATALOG_LOCK:
-            if started >= float(_CATALOG_CACHE.get("last_success") or 0.0):
-                _CATALOG_CACHE["negative_until"] = time.time() + NEGATIVE_TTL
+            if started_mono >= float(_catalog_state().get("last_success") or 0.0):
+                _catalog_state()["negative_until"] = time.monotonic() + NEGATIVE_TTL
         # No hardcoded stand-ins: an unreachable catalog means no models to offer.
         return cached if cached is not None else []
 
 
-_CLASSIC_CACHE: Dict[str, Any] = {
-    "at": 0.0, "ids": [], "negative_until": 0.0, "last_success": 0.0}
+_CLASSIC_STATES: Dict[str, Dict[str, Any]] = {}
 _CLASSIC_LOCK = threading.Lock()
+
+
+def _classic_state() -> Dict[str, Any]:
+    return _CLASSIC_STATES.setdefault(
+        _home_key(), {"at": 0.0, "ids": [], "negative_until": 0.0, "last_success": 0.0})
 
 
 def _classic_cache_path() -> Path:
@@ -727,12 +1000,53 @@ def _load_classic_cache() -> Optional[List[str]]:
     return ids or None
 
 
-def _store_classic_cache(ids: List[str]) -> None:
+def _store_classic_cache(ids: List[str], started: float) -> List[str]:
+    """Cache the fetch result; when a newer cross-process write wins, adopt and return IT.
+
+    Called under _CLASSIC_LOCK by _classic_models, so the skip-path state update is safe.
+    """
     try:
-        atomic_json_write(_classic_cache_path(),
-                          {"version": CACHE_SCHEMA, "fetched": time.time(), "ids": ids})
+        written = _guarded_cache_write(_classic_cache_path(),
+                                       {"version": CACHE_SCHEMA, "fetched": started, "ids": ids},
+                                       started)
+        if not written:
+            raw = read_json_or_empty(_classic_cache_path())
+            raw_ids = raw.get("ids")
+            # An explicit list (empty = withdrawal) only; a malformed ids field must not
+            # clear good data.
+            if isinstance(raw_ids, list) and _cache_schema_ok(raw):
+                valid = [i.strip() for i in raw_ids if _valid_id(i)]
+                if not raw_ids or valid:
+                    _classic_state()["ids"] = valid
+                    _classic_state()["at"] = float(raw.get("fetched") or started)
+                    return valid
     except Exception as exc:
         logger.debug("Could not cache the free classic model list: %s", exc)
+    return ids
+
+
+def _adopt_newer_classic_disk(state: Dict[str, Any]) -> None:
+    """Adopt a newer cross-process classic write over memory (called under _CLASSIC_LOCK).
+
+    A valid EMPTY list is a withdrawal and wins too; a non-empty list with zero valid ids is
+    hostile/corrupt and is ignored. Non-finite stamps never win.
+    """
+    try:
+        raw = read_json_or_empty(_classic_cache_path())
+        if not _cache_schema_ok(raw):
+            return
+        if not isinstance(raw.get("ids"), list):
+            return  # a missing/malformed ids field is NOT a withdrawal
+        fetched = float(raw.get("fetched") or 0)
+        if not math.isfinite(fetched) or fetched <= float(state["at"]):
+            return
+        raw_ids = _as_list(raw.get("ids"))
+        valid = [i.strip() for i in raw_ids if _valid_id(i)]
+        if not raw_ids or valid:
+            state["ids"] = valid
+            state["at"] = fetched
+    except Exception:
+        pass
 
 
 def _classic_models() -> List[str]:
@@ -745,19 +1059,30 @@ def _classic_models() -> List[str]:
     timeout per window rather than one per call.
     """
     with _CLASSIC_LOCK:
-        if time.time() - float(_CLASSIC_CACHE["at"]) < CATALOG_TTL:
-            return list(_CLASSIC_CACHE["ids"])
-        if time.time() < float(_CLASSIC_CACHE.get("negative_until") or 0.0):
-            # Another process may have written a good cache while this one was failing.
-            return list(_CLASSIC_CACHE["ids"]) or _load_classic_cache() or []
+        state = _classic_state()
+        age = time.time() - float(state["at"])
+        # A future "at" (backward clock step) must not read as permanently fresh.
+        if 0 <= age < CATALOG_TTL:
+            # A newer cross-process disk write wins over this process's memory.
+            _adopt_newer_classic_disk(state)
+            return list(state["ids"])
+        if time.monotonic() < float(_classic_state().get("negative_until") or 0.0):
+            # Another process may have written a good cache (or a withdrawal) while this one
+            # was failing: a newer disk write wins over stale memory here too.
+            state = _classic_state()
+            _adopt_newer_classic_disk(state)
+            return list(state["ids"]) or _load_classic_cache() or []
     cached = _load_classic_cache()
     # Only a fetch that began after the last successful one may record an outcome; otherwise a
     # slow failure would hide (or a slow success would overwrite) what a newer fetch produced.
     started = time.time()
+    started_mono = time.monotonic()
     fetched_ids: Optional[List[str]] = None
     try:
-        fetched = _unwrap_list(_http_get_json(CLASSIC_MODELS_URL),
-                               ("models", "data", "ids", "items", "results"))
+        fetched = _unwrap_list(
+            _http_get_json(CLASSIC_MODELS_URL), ("models", "data", "ids", "items", "results"),
+            fallback_key_ok=lambda k: "model" in k.lower(),
+            fallback_item_ok=lambda items: any(_valid_id(it) for it in items))
         if fetched is not None:
             # Only guarded strings can become URL path segments; anything else is discarded.
             valid = [item.strip() for item in fetched if _valid_id(item)]
@@ -774,19 +1099,21 @@ def _classic_models() -> List[str]:
         # A successful fetch is authoritative, empty or not: the free route may have been
         # withdrawn, and serving a stale id would send the user to a model that now errors.
         with _CLASSIC_LOCK:
-            if started >= float(_CLASSIC_CACHE.get("last_success") or 0.0):
-                _store_classic_cache(fetched_ids)
-                _CLASSIC_CACHE["ids"] = list(fetched_ids)
-                _CLASSIC_CACHE["at"] = time.time()
-                _CLASSIC_CACHE["negative_until"] = 0.0
+            if started_mono >= float(_classic_state().get("last_success") or 0.0):
+                winner = _store_classic_cache(fetched_ids, started)
+                _classic_state()["ids"] = list(winner)
+                if winner is fetched_ids:
+                    _classic_state()["at"] = started
+                _classic_state()["negative_until"] = 0.0
                 # START token, not completion time (see _catalog): later-started wins.
-                _CLASSIC_CACHE["last_success"] = started
+                _classic_state()["last_success"] = started_mono
+                return list(winner)
         return list(fetched_ids)
     # Remember the failure whether or not a stale cache exists (mirrors _catalog): a down
     # endpoint must cost one timeout per window, not one per call.
     with _CLASSIC_LOCK:
-        if started >= float(_CLASSIC_CACHE.get("last_success") or 0.0):
-            _CLASSIC_CACHE["negative_until"] = time.time() + NEGATIVE_TTL
+        if started_mono >= float(_classic_state().get("last_success") or 0.0):
+            _classic_state()["negative_until"] = time.monotonic() + NEGATIVE_TTL
     return list(cached) if cached else []
 
 
@@ -798,12 +1125,12 @@ def _classic_set() -> set:
     config that differs from the endpoint only in case still resolves; ``_classic_id_for``
     restores the endpoint's own spelling for the URL.
     """
-    return {key.lower() for key in _classic_models() if isinstance(key, str)}
+    return {_norm_id(key) for key in _classic_models() if isinstance(key, str)}
 
 
 def _classic_spelling() -> Dict[str, str]:
-    """Lowercase free classic id -> the endpoint's own spelling, for URL paths."""
-    return {key.lower(): key for key in _classic_models() if isinstance(key, str)}
+    """Normalized free classic id -> the endpoint's own spelling, for URL paths."""
+    return {_norm_id(key): key for key in _classic_models() if isinstance(key, str)}
 
 
 def _free_route_unavailable() -> bool:
@@ -813,15 +1140,19 @@ def _free_route_unavailable() -> bool:
     told their model is unavailable when the endpoint is simply down.
     """
     with _CLASSIC_LOCK:
-        return time.time() < float(_CLASSIC_CACHE.get("negative_until") or 0.0)
+        return time.monotonic() < float(_classic_state().get("negative_until") or 0.0)
 
 
 def _spec_cache_path() -> Path:
     return _hermes_home() / "cache" / "pollinations_spec_limits.json"
 
 
-_SPEC_CACHE: Dict[str, Any] = {"negative_until": 0.0, "last_success": 0.0}
+_SPEC_STATES: Dict[str, Dict[str, Any]] = {}
 _SPEC_LOCK = threading.Lock()
+
+
+def _spec_state() -> Dict[str, Any]:
+    return _SPEC_STATES.setdefault(_home_key(), {"negative_until": 0.0, "last_success": 0.0})
 
 
 def _is_int(value: Any) -> TypeGuard[int]:
@@ -887,9 +1218,10 @@ def _spec_limits() -> Dict[str, Optional[int]]:
     except Exception:
         pass
     with _SPEC_LOCK:
-        if time.time() < float(_SPEC_CACHE.get("negative_until") or 0.0):
+        if time.monotonic() < float(_spec_state().get("negative_until") or 0.0):
             return cached if cached is not None else _validated_limits({})
     started = time.time()
+    started_mono = time.monotonic()
     try:
         limits = _spec_limits_from(_http_get_json(SPEC_URL))
         if not any(v is not None for v in limits.values()):
@@ -898,20 +1230,20 @@ def _spec_limits() -> Dict[str, Optional[int]]:
             # cache survives and the next window retries, rather than caching "unknown".
             raise ValueError("Pollinations spec published no usable limits")
         with _SPEC_LOCK:
-            if started >= float(_SPEC_CACHE.get("last_success") or 0.0):
+            if started_mono >= float(_spec_state().get("last_success") or 0.0):
                 try:
-                    atomic_json_write(path, {"version": CACHE_SCHEMA, "fetched": time.time(),
-                                             "limits": limits})
+                    _guarded_cache_write(path, {"version": CACHE_SCHEMA, "fetched": started,
+                                                "limits": limits}, started)
                 except Exception as exc:
                     logger.debug("Could not cache Pollinations spec limits: %s", exc)
-                _SPEC_CACHE["negative_until"] = 0.0
-                _SPEC_CACHE["last_success"] = started
+                _spec_state()["negative_until"] = 0.0
+                _spec_state()["last_success"] = started_mono
         return limits
     except Exception as exc:
         logger.debug("Pollinations spec fetch failed: %s", exc)
         with _SPEC_LOCK:
-            if started >= float(_SPEC_CACHE.get("last_success") or 0.0):
-                _SPEC_CACHE["negative_until"] = time.time() + NEGATIVE_TTL
+            if started_mono >= float(_spec_state().get("last_success") or 0.0):
+                _spec_state()["negative_until"] = time.monotonic() + NEGATIVE_TTL
         return cached if cached is not None else _validated_limits({})
 
 
@@ -943,6 +1275,18 @@ def _as_bool(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in ("true", "yes", "on", "1")
     return False
+
+
+def _paid_flag(entry: Optional[Dict[str, Any]]) -> Optional[bool]:
+    """The entry's paid-only class: True/False, or None when the flag is unreadable.
+
+    A non-scalar ``paid_only`` (list/dict) cannot be classified; callers fail CLOSED on None
+    rather than letting _as_bool coerce it to False and spend with the toggle off.
+    """
+    raw = (entry or {}).get("paid_only")
+    if isinstance(raw, (list, dict)):
+        return None
+    return _as_bool(raw)
 
 
 # Catalog text fields are display metadata. The strengths column shows 120 characters and no
@@ -1039,7 +1383,24 @@ def _text(value: Any) -> str:
     """
     if not isinstance(value, str):
         return ""
-    return "".join(ch for ch in value[:TEXT_LIMIT] if ch.isprintable() or ch in " \t").strip()
+    # Newlines become spaces (dropping them fuses words: "Labs\n\nQuest" -> "LabsQuest");
+    # other control characters are dropped so a hostile entry cannot smuggle line breaks.
+    cleaned = "".join(ch if ch not in "\n\r" else " "
+                      for ch in value[:TEXT_LIMIT] if ch.isprintable() or ch in " \t\n\r")
+    return " ".join(cleaned.split())
+
+
+def _is_video_model(model: Dict[str, Any]) -> bool:
+    """True when the catalog positively marks the entry as video.
+
+    Retention and generate refuse positively-video entries; an entry with no modality signal
+    at all is ambiguous, not video, and keeps the saved-model visibility convention.
+    """
+    if not isinstance(model, dict):
+        return False
+    if str(model.get("category") or "").strip().lower() == "video":
+        return True
+    return "video" in {str(m).strip().lower() for m in _as_list(model.get("output_modalities"))}
 
 
 def _is_image_model(model: Dict[str, Any]) -> bool:
@@ -1058,7 +1419,7 @@ def _is_image_model(model: Dict[str, Any]) -> bool:
         return False
     if category == "image" or "image" in modalities:
         return True
-    return any("image" in str(endpoint).lower()
+    return any(isinstance(endpoint, str) and "image" in endpoint.lower()
                for endpoint in _as_list(model.get("supported_endpoints")))
 
 
@@ -1070,8 +1431,13 @@ def _classic_keys(model: Dict[str, Any]) -> List[str]:
     """
     if not isinstance(model, dict):
         return []
-    return [key for key in [_name_of(model), *_as_list(model.get("aliases"))]
-            if isinstance(key, str)]
+    # Aliases get the same _text cleaning as the index, so a whitespace-padded alias
+    # still matches the classic set.
+    keys = [_name_of(model)] + [_text(a) for a in _as_list(model.get("aliases"))]
+    alt = model.get("id")
+    if isinstance(alt, str) and _valid_id(alt):
+        keys.append(_text(alt))  # the alternate id can be the spelling classic serves
+    return [key for key in keys if isinstance(key, str) and key]
 
 
 def _is_free_classic(model: Dict[str, Any], classic: set) -> bool:
@@ -1079,7 +1445,7 @@ def _is_free_classic(model: Dict[str, Any], classic: set) -> bool:
 
     ``classic`` is the lowercased set from ``_classic_set()``.
     """
-    return any(key.lower() in classic for key in _classic_keys(model))
+    return any(_norm_id(key) in classic for key in _classic_keys(model))
 
 
 def _catalog_entry(catalog: List[Dict[str, Any]], model: Optional[str]) -> Optional[Dict[str, Any]]:
@@ -1101,7 +1467,9 @@ def _edit_path(entry: Optional[Dict[str, Any]]) -> Optional[str]:
         if not isinstance(endpoint, str):
             continue
         candidate = endpoint.strip().split("?", 1)[0].split("#", 1)[0].strip()
-        if candidate.lower().endswith("/edits"):
+        # An IMAGE edits endpoint only: /v1/audio/edits must not enable image editing.
+        # The version segment stays flexible (/v2/images/edits follows upstream).
+        if re.search(r"/images?/edits$", candidate, re.IGNORECASE):
             return candidate
     return None
 
@@ -1142,13 +1510,15 @@ def _edit_url(entry: Optional[Dict[str, Any]]) -> str:
     # A relative path may carry its own query or fragment; neither belongs in an endpoint we
     # construct, and a fragment would silently truncate the path for urlsplit-based consumers.
     clean = path.split("?", 1)[0].split("#", 1)[0]
+    if any(seg == ".." for seg in clean.split("/")):
+        return EDIT_URL  # dot-segments could normalize to another path; do not guess
     return ENTER_BASE_URL + (clean if clean.startswith("/") else "/" + clean)
 
 
 def _reference_cap(entry: Optional[Dict[str, Any]]) -> int:
     """The catalog's published reference-image cap, ceilinged; a conservative default otherwise.
 
-    Published caps observed to date range 1-16. Models that publish none (mostly community
+    Published caps observed to date range 0-16 (0 disables edits). Models that publish none (mostly community
     endpoints) get a conservative default rather than the ceiling: such endpoints commonly
     accept a single image, and over-sending would 400. An explicit cap is honored up to the
     ceiling; a published 0 means no reference images and disables edits for the entry.
@@ -1184,15 +1554,15 @@ def _classic_id_for(model: str, catalog: List[Dict[str, Any]]) -> Optional[str]:
     Matching is case-insensitive; the endpoint's own spelling is what goes in the URL.
     """
     spelling = _classic_spelling()
-    wanted = model.strip().lower()
+    wanted = _norm_id(model.strip())
     # A model the classic API serves by its own id needs no catalog entry, so a stale catalog
     # cannot strand a keyless user on a model that is in fact free.
     if wanted in spelling:
         return spelling[wanted]
     entry = _catalog_entry(catalog, model)
     for key in _classic_keys(entry) if entry else []:
-        if key.lower() in spelling:
-            return spelling[key.lower()]
+        if _norm_id(key) in spelling:
+            return spelling[_norm_id(key)]
     return None
 
 
@@ -1207,6 +1577,39 @@ def _pricing_quantity(model: Dict[str, Any]) -> float:
     return quantity if quantity is not None and quantity > 0 else 1.0
 
 
+def _image_adjustments(model: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """The catalog's per-image pricing adjustments (fees/premiums), shape-guarded.
+
+    Video-kind adjustments belong to video billing and are excluded from image estimates.
+    """
+    return [a for a in _as_list(model.get("pricing_adjustments"))
+            if isinstance(a, dict) and str(a.get("kind") or "image").lower() != "video"]
+
+
+def _adjustments_per_image(model: Dict[str, Any]) -> float:
+    """Sum of adjustments convertible to a per-image pollen figure (generation/image units).
+
+    GPU-second, USD and other unconvertible units are excluded — they surface as a label
+    hint instead of a false estimate. Rates are strings per the spec; guarded like all
+    catalog numbers.
+    """
+    total = 0.0
+    for adj in _image_adjustments(model):
+        if _as_dict(adj.get("option")).get("default") is False:
+            continue  # an optional fee that is off by default is not part of the floor
+        unit = _text(adj.get("unit")).lower()
+        if unit not in ("", "generation", "image", "images"):
+            continue
+        if _text(adj.get("currency")).lower() not in ("", "pollen"):
+            continue
+        price = _as_number(adj.get("price"))
+        if price is None or price < 0:
+            continue
+        qty = _as_number(adj.get("quantity"))
+        total += price * (qty if qty is not None and qty > 0 else 1.0)
+    return total
+
+
 def _price_class(model: Dict[str, Any]) -> int:
     """Ordering class: 0 = comparable per-image cost, 1 = per-token (or other unconvertible
     unit), 2 = no published price. Per-token rates cannot be compared to per-image costs
@@ -1214,6 +1617,10 @@ def _price_class(model: Dict[str, Any]) -> int:
     unpublished price sorts last rather than masquerading as the cheapest."""
     amount = _as_number(_as_dict(model.get("pricing")).get("completionImageTokens"))
     if amount is None or amount < 0:
+        pricing = _as_dict(model.get("pricing"))
+        if (_as_number(pricing.get("completionTextTokens")) is not None
+                or _as_number(pricing.get("promptTextTokens")) is not None):
+            return 1  # text-token billing is still per-token, not "unpublished"
         return 2
     if amount == 0:
         return 0
@@ -1225,6 +1632,17 @@ def _price_class(model: Dict[str, Any]) -> int:
     return 1
 
 
+def _variant_floor(model: Dict[str, Any], base: float) -> float:
+    """Lowest published per-image rate across base and variants: a 'from' figure must be a
+    true floor (a live variant can be cheaper than the base rate)."""
+    floor = base
+    for variant in _as_list(model.get("pricing_variants")):
+        rate = _as_number(_as_dict(variant).get("completionImageTokens"))
+        if rate is not None and 0 <= rate < floor:
+            floor = rate
+    return floor
+
+
 def _price_value(model: Dict[str, Any]) -> float:
     """Estimated per-image pollen cost for ordering, within the model's price class.
 
@@ -1232,15 +1650,23 @@ def _price_value(model: Dict[str, Any]) -> float:
     scale by the plugin's typical output area. Per-token rates keep their raw figure (only
     comparable within class 1). Unpublished prices read as zero but sort last via the class.
     """
-    amount = _as_number(_as_dict(model.get("pricing")).get("completionImageTokens"))
-    if amount is None or amount < 0 or amount == 0:
-        return 0.0
+    pricing = _as_dict(model.get("pricing"))
+    amount = _as_number(pricing.get("completionImageTokens"))
+    adjustments = _adjustments_per_image(model)
+    if amount is None or amount < 0:
+        # Text-token-only models keep a class-1 relative figure (completion rate preferred).
+        rate = _as_number(pricing.get("completionTextTokens"))
+        if rate is None:
+            rate = _as_number(pricing.get("promptTextTokens"))
+        return rate if rate is not None and rate >= 0 else 0.0
+    if amount == 0:
+        return adjustments
     unit = _pricing_unit(model)
     quantity = _pricing_quantity(model)
     if unit == "megapixel":
-        return amount * quantity * _TYPICAL_MP
+        return _variant_floor(model, amount) * quantity * _TYPICAL_MP + adjustments
     if unit in ("", "image", "images", "generation") and _as_bool(model.get("flat_rate")):
-        return amount * quantity
+        return _variant_floor(model, amount) * quantity + adjustments
     return amount
 
 
@@ -1278,13 +1704,15 @@ def _advertises_free(model: Dict[str, Any]) -> bool:
     """
     if _as_number(_as_dict(model.get("pricing")).get("completionImageTokens")) == 0:
         return True
-    text = f"{model.get('title') or ''} {model.get('name') or ''}"
+    text = f"{_text(model.get('title'))} {_text(model.get('name'))}"
     return re.search(r"\bfree\b", text, re.IGNORECASE) is not None
 
 
 def _pricing_unit(model: Dict[str, Any]) -> str:
     """The unit the catalog bills ``completionImageTokens`` in, lowercased; '' for per image.
 
+    The spec's unit enum is megapixel/token/byte; image/images/generation are lenient
+    per-image synonyms, and any other unit reads as a generic per-unit charge (class 1).
     Sanitized like every catalog text field: a hostile unit must not smuggle line breaks or an
     absurd label into the picker's price column.
     """
@@ -1304,7 +1732,7 @@ def _price_label(model: Dict[str, Any], free_classic: bool, has_key: bool,
     classic route even keyed (the enter API does not serve it). ``supported_endpoints`` decides
     edit support, ``flat_rate`` whether the published price is per image or per token.
     """
-    paid_only = _as_bool(model.get("paid_only"))
+    paid_only = _paid_flag(model) is not False
     amount = _as_number(_as_dict(model.get("pricing")).get("completionImageTokens"))
     # The spec guarantees "pollen", but the catalog publishes the currency — read it live.
     currency = _text(_as_dict(model.get("pricing")).get("currency"))[:16] or "pollen"
@@ -1314,25 +1742,88 @@ def _price_label(model: Dict[str, Any], free_classic: bool, has_key: bool,
         if paid_only:
             return "Free on the classic route · watermark · reduced size · no key needed"
         return "Free · watermark · reduced size · no key needed"
+    pricing = _as_dict(model.get("pricing"))
+    unit = _pricing_unit(model)
+    flat = unit in ("", "image", "images", "generation") and _as_bool(model.get("flat_rate"))
+    adjustments = _image_adjustments(model)
+    fees = _adjustments_per_image(model)
+    folded = False  # whether convertible fees are included in the displayed figure
     if amount is None:
-        # A title that says "free" describes the free classic route; once a key is set this model
-        # is billed through the enter API, so the label must not imply it is free.
-        cost = ("No published price" if has_key
-                else ("Free pollen" if _advertises_free(model) else "No published price"))
-    else:
-        unit = _pricing_unit(model)
-        if unit and unit not in ("image", "images", "generation", "token", "tokens"):
-            # e.g. "megapixel": the published figure is per unit, not per image.
-            cost = f"charged per {unit}"
-        elif not _as_bool(model.get("flat_rate")) or unit in ("token", "tokens"):
+        # No image rate published: text-token rates still mean per-token billing; a name that
+        # says "free" is marketing copy, not a published price, so both states agree.
+        text_rate = (_as_number(pricing.get("completionTextTokens"))
+                     if _as_number(pricing.get("completionTextTokens")) is not None
+                     else _as_number(pricing.get("promptTextTokens")))
+        if text_rate is not None:
             cost = "charged per token"
+        elif adjustments:
+            cost = "usage-based fees"  # the fees ARE the price; no base figure is published
+            folded = True
         else:
-            cost = _format_price(amount, currency)
+            cost = "No published price"
+    elif amount == 0:
+        # A published zero image rate is Free only when nothing else is billed: positive
+        # text-token rates still charge, and convertible fees still apply.
+        text_billed = any(
+            (rate := _as_number(pricing.get(field))) is not None and rate > 0
+            for field in ("completionTextTokens", "promptTextTokens"))
+        if text_billed:
+            cost = (_format_price(fees, currency) + " · text billed") if fees else "Free image · text billed"
+        else:
+            cost = _format_price(fees, currency)
+        folded = True
+    elif unit == "megapixel":
+        # rate x quantity is the published per-unit figure — show it (no area assumption).
+        # A zero-rate variant must not erase a paid base: show the base + a free-variant note.
+        floor = _variant_floor(model, amount)
+        shown = amount if floor == 0 else floor
+        cost = f"≈{_format_price(shown * _pricing_quantity(model), currency)} per megapixel"
+        if floor == 0:
+            cost += f" (variant {_format_price(fees, currency)})" if fees else " (free variant)"
+    elif unit and unit not in ("image", "images", "generation", "token", "tokens"):
+        # e.g. "byte": a generic per-unit charge, display-bounded like every label field.
+        cost = f"charged per {unit[:32]}"
+    elif not flat or unit in ("token", "tokens"):
+        cost = "charged per token"
+    else:
+        # The per-image figure includes convertible per-generation fees and the unit quantity
+        # so the label and the sort estimate agree. A zero-rate variant must not erase a paid
+        # base: show the base figure + a free-variant note (the sort keeps the true floor).
+        floor = _variant_floor(model, amount)
+        shown = amount if floor == 0 else floor
+        cost = _format_price(shown * _pricing_quantity(model) + fees, currency)
+        if floor == 0:
+            cost += f" (variant {_format_price(fees, currency)})" if fees else " (free variant)"
+        folded = True
     # A model priced per variant (a 2K tier, an edit operation) can cost more than the base
-    # figure the picker shows, so mark that the figure is a floor.
-    if _as_list(model.get("pricing_variants")) and cost.endswith(currency):
-        cost = f"from {cost}"
+    # figure the picker shows: a numeric floor reads "from X"; a per-unit figure says so.
+    variants = _as_list(model.get("pricing_variants"))
+    if variants:
+        cheaper = amount is not None and any(
+            (rate := _as_number(_as_dict(v).get("completionImageTokens"))) is not None
+            and 0 <= rate < amount for v in variants)
+        if cost == "Free":
+            cost = "Free base (variants may cost more)"
+        elif "(free variant)" in cost or "(variant " in cost:
+            # The note explains the cheaper direction; still warn about pricier variants.
+            if amount is not None and any(
+                    (rate := _as_number(_as_dict(v).get("completionImageTokens"))) is not None
+                    and rate > amount for v in variants):
+                cost += " (variants may cost more)"
+        elif cost.startswith("≈") or cost.startswith("charged per"):
+            cost = f"{cost} (variants differ)" if cheaper else f"{cost} (variants may cost more)"
+        elif cost not in ("No published price", "usage-based fees"):
+            cost = f"from {cost}"
     parts = [cost]
+    if adjustments and (not folded or any(
+            _text(a.get("unit")).lower() not in ("", "generation", "image", "images")
+            or _text(a.get("currency")).lower() not in ("", "pollen")
+            for a in adjustments)):
+        parts.append("fees extra")
+    if has_key:
+        input_rate = _as_number(pricing.get("promptImageTokens"))
+        if input_rate is not None and input_rate > 0:
+            parts.append("input billed")
     if free_classic:
         parts.append("no watermark")
     if has_key and _supports_edits(model):
@@ -1344,8 +1835,8 @@ def _price_label(model: Dict[str, Any], free_classic: bool, has_key: bool,
 def _iso_date(model: Dict[str, Any]) -> str:
     """The catalog's ``added_date`` as a day, whatever unit it is in.
 
-    The field is documented as milliseconds, but a switch to seconds would otherwise render every
-    model as 1970, so the magnitude decides.
+    The spec publishes a number with no unit description; live data is milliseconds, but a
+    switch to seconds would otherwise render every model as 1970, so the magnitude decides.
     """
     raw = model.get("added_date")
     if not _is_number(raw):
@@ -1377,14 +1868,69 @@ def _index(catalog: List[Dict[str, Any]]) -> Dict[str, str]:
         name = _name_of(model) if isinstance(model, dict) else None
         if not name:
             continue
-        for key in [name, *[clean for a in _as_list(model.get("aliases"))
-                             if (clean := _text(a))]]:
+        keys = [name, *[clean for a in _as_list(model.get("aliases"))
+                        if (clean := _text(a))]]
+        # The ``id`` fallback is selectable too: a catalog publishing both name and id must
+        # resolve an id-addressed model with its metadata, not as an unknown passthrough.
+        alt = model.get("id")
+        if isinstance(alt, str) and _valid_id(alt) and alt.strip() != name:
+            keys.append(alt.strip())
+        for key in keys:
             if key in out and out[key] != name:
                 logger.debug("Pollinations catalog reuses %r for both %r and %r; keeping %r.",
                              key, out[key], name, out[key])
                 continue
             out[key] = name
     return out
+
+
+# UTS#39-lite confusable guard: NFKC+casefold absorbs ligature/fullwidth spellings; these
+# dash variants look identical to '-' but NFKC leaves them alone.
+_DASH_CONFUSABLES = str.maketrans({c: "-" for c in "\u2010\u2011\u2012\u2013\u2014\u2015\u2212\uFE58\uFE63\uFF0D"})
+
+
+def _norm_id(value: str) -> str:
+    """Id-matching normalization: NFKC + casefold + dash confusables, so a ligature or
+    fullwidth spelling of a paid id still reaches the paid gate instead of passing through
+    as an unknown id. The catalog's own spelling is always what gets sent."""
+    return unicodedata.normalize("NFKC", value).casefold().translate(_DASH_CONFUSABLES)
+
+
+def _folded_index(catalog: List[Dict[str, Any]]) -> Dict[str, str]:
+    """Case-folded name/alias/id -> canonical id, canonical names first (first entry wins).
+
+    Catalog matching is case-insensitive like the classic matching, but the catalog's own
+    spelling is restored, so a case variant of a paid id still reaches the paid gate instead
+    of passing through ungated.
+    """
+    out: Dict[str, str] = {}
+    for model in catalog:
+        name = _name_of(model) if isinstance(model, dict) else None
+        if name:
+            out.setdefault(_norm_id(name), name)
+    for model in catalog:
+        name = _name_of(model) if isinstance(model, dict) else None
+        if not name:
+            continue
+        keys = [clean for a in _as_list(model.get("aliases")) if (clean := _text(a))]
+        alt = model.get("id")
+        if isinstance(alt, str) and _valid_id(alt):
+            keys.append(alt.strip())
+        for key in keys:
+            out.setdefault(_norm_id(key), name)
+    return out
+
+
+def _has_t2i_signal(model: Dict[str, Any]) -> bool:
+    """True when the entry can run text-to-image: a non-edits image endpoint, or no endpoints
+    published at all (the category signal alone). An edits-only entry needs a source image,
+    so it must not become the preselected default."""
+    endpoints = [e for e in _as_list(model.get("supported_endpoints")) if isinstance(e, str)]
+    if not endpoints:
+        return True
+    return any("/image" in e.lower()
+               and not e.lower().split("?", 1)[0].rstrip("/").endswith("/edits")
+               for e in endpoints)
 
 
 def _derived_default(catalog: List[Dict[str, Any]], classic: set,
@@ -1409,24 +1955,37 @@ def _derived_default(catalog: List[Dict[str, Any]], classic: set,
             continue
         if _is_free_classic(model, classic):
             # A free-classic model the catalog also marks paid-only is still usable keyless, but
-            # a plainly free one is the better default.
-            if not _as_bool(model.get("paid_only")):
-                return name
-            if free_fallback is None:
+            # a plainly free one is the better default. Keyed, generate() refuses paid-only
+            # models while the toggle is off, so they are no derived default at all.
+            if _paid_flag(model) is False:
+                # Keyed, a catalog-listed model routes to ENTER even when classic serves it:
+                # an SVG or edits-only entry would be refused there, so keep looking. Keyless
+                # classic rasterizes to JPEG and runs (the SVG exception).
+                if not has_key or (not _is_svg_product(model) and _has_t2i_signal(model)):
+                    return name
+            if free_fallback is None and not has_key:
                 free_fallback = name
-        if fallback is None and has_key and not _as_bool(model.get("paid_only")):
+        if (fallback is None and has_key and _paid_flag(model) is False
+                and _has_t2i_signal(model) and not _is_svg_product(model)):
             fallback = name
     if free_fallback:
         return free_fallback
     if fallback:
         return fallback
     classic_ids = _classic_models()
+    if has_key:
+        # A classic id the catalog classifies paid-only (or unreadable) is refused by
+        # generate() keyed; keep only unclassified ids (classic route) and free ones.
+        classic_ids = [cid for cid in classic_ids
+                       if _paid_flag(_catalog_entry(catalog, cid)) is False]
     return classic_ids[0] if classic_ids else None
 
 
 def _resolve_model(explicit: Optional[str], catalog: List[Dict[str, Any]]) -> Optional[str]:
     """First candidate naming a catalog model (canonical id preferred over alias), else passthrough.
 
+    Catalog names/aliases match case-insensitively and restore the catalog's own spelling, so a
+    case variant still reaches the paid gate. A classic-served id outranks a paid alias claim.
     An unknown id passes through verbatim, so a model added upstream works the day it appears —
     with one exception. Hermes injects the shared top-level ``image_gen.model`` as the explicit
     ``model`` kwarg on every tool call, so an unknown value there is usually another provider's
@@ -1438,15 +1997,17 @@ def _resolve_model(explicit: Optional[str], catalog: List[Dict[str, Any]]) -> Op
     ``None`` when nothing is configured and the catalog offers no default to derive.
     """
     index = _index(catalog)
+    folded = _folded_index(catalog)
     config = load_image_gen_config()
     scoped = config.get(PROVIDER_ID)
     shared = config.get("model")
     shared_norm = shared.strip() if isinstance(shared, str) else ""
     has_key = _api_key() is not None
     classic = _classic_set()
+    spelling = _classic_spelling()
     candidates = [
         explicit,
-        os.environ.get(MODEL_ENV, "").strip(),
+        _model_env(),
         scoped.get("model") if isinstance(scoped, dict) else None,
         shared,
     ]
@@ -1458,13 +2019,41 @@ def _resolve_model(explicit: Optional[str], catalog: List[Dict[str, Any]]) -> Op
             canonical = next((_name_of(m) for m in catalog if _name_of(m) == wanted), None)
             if canonical is not None:
                 return canonical
+            key = _norm_id(wanted)
+            if key in spelling:
+                # A classic-served id keeps the endpoint's own spelling unless a readable,
+                # non-paid image entry legitimately claims it as an alias. A paid (or
+                # unreadable) entry must not hijack the user's free model. A normalized
+                # CANONICAL beats an exact alias claim here too (same rule as below).
+                folded_target = folded.get(key)
+                # A folded value is always SOME entry's canonical name; it is a canonical
+                # match for THIS key only when that name itself normalizes to the key. An
+                # alias-derived folded value falls through to the exact-alias lookup, so
+                # case-variant alias collisions rank exactly like the non-classic path.
+                if folded_target is not None and _norm_id(folded_target) == key:
+                    target = folded_target
+                else:
+                    target = index.get(wanted) or folded.get(key)
+                entry = _catalog_entry(catalog, target) if target else None
+                if entry is not None and _is_image_model(entry) and _paid_flag(entry) is False:
+                    return target
+                return spelling[key]
+            # A normalized CANONICAL beats another model's exact alias (the folded index is
+            # canonical-first), so a case variant of a free id cannot be hijacked by a paid
+            # entry claiming the lowercase spelling as an alias. Alias-derived folded values
+            # are NOT canonical matches: they fall through to the exact-alias ranking below.
+            target = folded.get(key)
+            if target is not None and _norm_id(target) == key:
+                return target
             if wanted in index:
                 return index[wanted]
+            if key in folded:
+                return folded[key]
     for position, candidate in enumerate(candidates[:3]):
         value = candidate.strip() if isinstance(candidate, str) else ""
         if not value or not _valid_id(value):
             continue
-        if position == 0 and value == shared_norm and value.lower() not in classic:
+        if position == 0 and value == shared_norm and _norm_id(value) not in classic:
             # The injected shared kwarg carrying an unknown id: likely another provider's leftover.
             # A classic-served id is exempt: the free route can run it (keyed included), so the
             # user's saved free model must not be swapped for a billed Quest default.
@@ -1472,7 +2061,7 @@ def _resolve_model(explicit: Optional[str], catalog: List[Dict[str, Any]]) -> Op
         # An unknown id passes through so a model added upstream works the day it appears.
         # Keyless, though, only the free classic route can run it, and an id the catalog
         # does not know there is far more likely a leftover than a brand-new free model.
-        if has_key or value.lower() in classic:
+        if has_key or _norm_id(value) in classic:
             return value
         logger.debug("Ignoring %r: not a catalog model and not served keyless.", value)
     return _derived_default(catalog, classic, has_key)
@@ -1532,6 +2121,8 @@ def _encode_input_image(raw: bytes) -> str:
     mime = _sniff_image_mime(raw)
     if mime not in ACCEPTED_INPUT_MIME:
         raise ValueError("source image is not a supported PNG, JPEG, GIF or WebP image")
+    if not _image_is_complete(raw, mime):
+        raise ValueError("source image is incomplete or corrupt")
     return f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
 
 
@@ -1599,10 +2190,29 @@ def _to_data_url(value: str, limit: int = MAX_INPUT_IMAGE_BYTES) -> str:
         header, _, data = candidate.partition(",")
         if not header.lower().startswith("data:image/") or ";base64" not in header.lower():
             raise ValueError("source image data URL must be a base64 image")
-        if (len(data) * 3) // 4 > limit:
+        # Exact decoded length: the naive (len*3)//4 overestimates by the base64 padding
+        # (up to 2 bytes), falsely rejecting an exactly-at-cap image that local/URL accept.
+        if (len(data) * 3) // 4 - data.count("=") > limit:
             raise ValueError(f"source image exceeds {limit} bytes")
         return _encode_input_image(base64.b64decode(data, validate=True))
     return _local_image_to_data_url(candidate, limit)
+
+
+_SVG_PRODUCT_RE = re.compile(r"\bsvg\b", re.IGNORECASE)
+
+
+def _is_svg_product(model: Optional[Dict[str, Any]]) -> bool:
+    """True when the live title/description advertises SVG output. This plugin returns raster
+    images only, so an SVG-product model is refused BEFORE the request — a paid attempt would
+    bill and then fail the output gate. Detection is live-text driven (no hardcoded model
+    ids); over-disabling is the safe failure mode."""
+    if not isinstance(model, dict):
+        return False
+    if any(isinstance(m, str) and m.strip().lower() in ("svg", "image/svg+xml")
+           for m in _as_list(model.get("output_modalities"))):
+        return True
+    text = f"{_text(model.get('title'))} {_text(model.get('description'))}"
+    return _SVG_PRODUCT_RE.search(text) is not None
 
 
 def _visible_edit_models(catalog: List[Dict[str, Any]], *, include_paid: bool,
@@ -1617,7 +2227,9 @@ def _visible_edit_models(catalog: List[Dict[str, Any]], *, include_paid: bool,
             continue
         if not _supports_edits(model):
             continue
-        if _as_bool(model.get("paid_only")) and not include_paid:
+        if _is_svg_product(model):
+            continue
+        if _paid_flag(model) is None or (_paid_flag(model) is not False and not include_paid):
             continue
         name = _name_of(model)
         if name:
@@ -1803,8 +2415,9 @@ class PollinationsImageGenProvider(ImageGenProvider):
         models follow them (no published token count to compare with), and unpublished prices
         sort last. No key → the free classic model only. Key → every Quest-eligible model. Key
         plus the ``include_paid_models`` setting → the paid-only catalog too. The user's saved
-        model is always kept visible, so removing the key or turning the setting off never makes
-        a configured model silently disappear.
+        model is kept visible whenever the current state can run it (a keyed passthrough id gets
+        a minimal row; a retained paid row is marked disabled), so removing the key or turning
+        the setting off never makes a runnable configured model silently disappear.
         """
         catalog = _catalog()
         classic = _classic_set()
@@ -1812,45 +2425,80 @@ class PollinationsImageGenProvider(ImageGenProvider):
         include_paid = has_key and _include_paid_models(self._plugin_id)
 
         rows: Dict[str, Dict[str, Any]] = {}
+        seen_lower: set = set()
         for model in catalog:
             if not _is_image_model(model):
                 continue
             name = _name_of(model)
             if not name:
                 continue
-            if name in rows:
+            if name in rows or name.lower() in seen_lower:
                 logger.debug("Pollinations catalog lists %r more than once; keeping the first.", name)
                 continue
             free_classic = _is_free_classic(model, classic)
-            if not free_classic:
-                if not has_key:
+            if not has_key:
+                if not free_classic:
                     continue  # state 1: the free classic API is the only keyless route
-                if _as_bool(model.get("paid_only")) and not include_paid:
-                    continue  # state 2: Quest-eligible only
+            elif _paid_flag(model) is None:
+                continue  # unreadable billing: generate() refuses it regardless of the toggle
+            elif _paid_flag(model) is not False and not include_paid:
+                # state 2: Quest-eligible only (unreadable flags stay hidden). Keyed, a
+                # paid-only model is refused by generate() even when classic serves it, so
+                # it must not be offered here either.
+                continue
             rows[name] = _specs(model, free_classic, has_key)
+            if has_key and _is_svg_product(model):
+                rows[name]["price"] += " · disabled (SVG output unsupported)"
+            seen_lower.add(name.lower())
 
         if not has_key:
             # The classic endpoint is the source of truth for the keyless route: Pollinations can
             # drop a free model from the catalog while still serving it, and a stale catalog must
             # not leave a keyless user with nothing to pick.
             for key in [item.strip() for item in _classic_models() if _valid_id(item)]:
-                if key not in rows:
+                if key not in rows and key.lower() not in seen_lower:
                     # The classic endpoint publishes no metadata, so the row is built from the id
                     # alone; ``input_modalities`` states what the route accepts.
                     rows[key] = _specs({"name": key, "input_modalities": ["text"]},
                                       True, has_key)
+                    seen_lower.add(key.lower())
 
         configured = _configured_model(catalog)
-        if configured and configured not in rows:
+        if configured and configured not in rows and configured.lower() not in seen_lower:
             saved = next((m for m in catalog if _name_of(m) == configured), None)
             if saved is not None:
-                rows[configured] = _specs(saved, _is_free_classic(saved, classic), has_key)
-            elif _valid_id(configured) and configured.lower() in classic:
+                # Retention keeps the user's saved model visible — but never a video entry:
+                # the picker offers image models only, matching capabilities() and generate().
+                if not _is_video_model(saved):
+                    rows[configured] = _specs(saved, _is_free_classic(saved, classic), has_key)
+                    if _is_svg_product(saved) and (has_key or _classic_id_for(configured, catalog) is None):
+                        # generate() refuses SVG before the paid gate — except a KEYLESS
+                        # classic-served call, which rasterizes to JPEG and runs. Mirror that
+                        # exemption so the marker never contradicts what generate() does.
+                        rows[configured]["price"] += " · disabled (SVG output unsupported)"
+                    elif has_key and _paid_flag(saved) is None:
+                        rows[configured]["price"] += " · disabled (unreadable billing flag)"
+                    elif has_key and _paid_flag(saved) is not False and not include_paid:
+                        # Say plainly that generate() will refuse this row until the toggle
+                        # is on, rather than offering an unrunnable choice unexplained.
+                        rows[configured]["price"] += " · disabled (paid toggle off)"
+                    elif not has_key and not _is_free_classic(saved, classic):
+                        rows[configured]["price"] += " · disabled (needs a key)"
+                    seen_lower.add(configured.lower())
+            elif _valid_id(configured) and _norm_id(configured) in classic:
                 # A saved classic-only model the catalog omits: the classic route can still run
                 # it (keyed included), so keep the user's choice visible with an honest label.
-                spelling = _classic_spelling().get(configured.lower(), configured)
+                spelling = _classic_spelling().get(_norm_id(configured), configured)
                 rows[spelling] = _specs({"name": spelling, "input_modalities": ["text"]},
                                         True, has_key, classic_route=True)
+                seen_lower.add(spelling.lower())
+            elif has_key and _valid_id(configured):
+                # A saved passthrough id the catalog does not list: keyed it still runs, so
+                # keep the user's choice visible with an honest minimal row. Keyless it
+                # cannot run unless classic serves it (the branch above).
+                rows[configured] = _specs({"name": configured, "input_modalities": ["text"]},
+                                          False, has_key)
+                seen_lower.add(configured.lower())
 
         def _order(row: Dict[str, Any]) -> tuple:
             if not has_key and row["free_classic"]:
@@ -1861,8 +2509,18 @@ class PollinationsImageGenProvider(ImageGenProvider):
         return catalog_rows({row["id"]: row for row in ordered}, fields=MODEL_FIELDS)
 
     def default_model(self) -> Optional[str]:
-        """The free classic model, else the first Quest-eligible one — both read live."""
-        return _derived_default(_catalog(), _classic_set(), _api_key() is not None)
+        """The resolved configured model when one is set, else the live-derived default.
+
+        Returning the configured model keeps the CLI picker's "currently in use" marker on
+        the right row for saved aliases/case variants (the core compares the raw config value
+        against row ids and falls back to this method). With nothing configured, the free
+        classic model leads, else the first Quest-eligible one — both read live.
+        """
+        catalog = _catalog()
+        configured = _configured_model(catalog)
+        if configured:
+            return configured
+        return _derived_default(catalog, _classic_set(), _api_key() is not None)
 
     def capabilities(self) -> Dict[str, Any]:
         """What the configured model can do, every part read from the live catalog.
@@ -1878,7 +2536,12 @@ class PollinationsImageGenProvider(ImageGenProvider):
         """
         catalog = _catalog()
         entry = _catalog_entry(catalog, _configured_model(catalog))
-        if not _is_image_model(entry):
+        if entry is None or not _is_image_model(entry) or (_api_key() and _is_svg_product(entry)):
+            entry = None
+        if (entry is not None and (_paid_flag(entry) is None
+                or (_paid_flag(entry) is not False and not _include_paid_models(self._plugin_id)))):
+            # generate() refuses this model while the toggle is off; the schema must not
+            # advertise edits/resolution the call cannot perform.
             entry = None
         capabilities: Dict[str, Any] = {"modalities": ["text"], "max_reference_images": 0}
         if _supports_resolution(entry):
@@ -1931,21 +2594,43 @@ class PollinationsImageGenProvider(ImageGenProvider):
                       "reached and no model is configured; check your connection and try again.",
                 error_type="no_model_available", provider=PROVIDER_ID, prompt=prompt,
                 aspect_ratio=aspect)
-        width, height = SIZES[aspect]
+        # A future core aspect ratio degrades to square instead of raising KeyError out of
+        # generate() (the bundled SIZES.get convention).
+        width, height = SIZES.get(aspect) or SIZES["square"]
         entry = _catalog_entry(catalog, model)
         fail = error_factory(PROVIDER_ID, aspect, model=model, prompt=prompt)
 
+        # A known catalog entry must be an image model: a hand-configured video id is refused
+        # here rather than routed to the image endpoint (capabilities already advertises it
+        # text-only, and the picker never offers it).
+        if entry is not None and _is_video_model(entry):
+            return fail(
+                f"Model '{model}' is a video model, not an image model. Pick an image model "
+                "from the picker.", "model_unavailable")
+        if entry is not None and _is_svg_product(entry):
+            # The enter route would return SVG, which the raster output gate refuses AFTER
+            # billing. Only a KEYLESS classic-served call rasterizes to JPEG: keyed, a
+            # catalog-listed model routes to enter even when classic serves it.
+            if not (_api_key() is None and _classic_id_for(model, catalog) is not None):
+                return fail(
+                    f"Model '{model}' produces SVG output, which this plugin cannot return. "
+                    "Pick a raster image model from the picker.", "unsupported")
         # The paid toggle gates invocation, not just the picker: a paid-only catalog model must
         # not spend while the setting is off, whichever path (kwarg, env, config) selected it.
+        # An unreadable paid_only flag fails CLOSED — the billing class cannot be verified.
         # Keyless calls keep the free-route guidance below; an id the catalog does not know
         # cannot be classified and passes through as before.
-        if (_api_key() is not None and entry is not None
-                and _as_bool(entry.get("paid_only"))
-                and not _include_paid_models(self._plugin_id)):
-            return fail(
-                f"Model '{model}' is paid-only and 'Include paid models' is off. Enable it "
-                "under Desktop → Settings → Plugins → Pollinations, or pick a Quest-eligible "
-                "model.", "paid_model_disabled")
+        if _api_key() is not None and entry is not None:
+            paid = _paid_flag(entry)
+            if paid is None:
+                return fail(
+                    f"Model '{model}' publishes an unreadable paid_only flag; refusing to run "
+                    "it while its billing class cannot be verified.", "model_unavailable")
+            if paid and not _include_paid_models(self._plugin_id):
+                return fail(
+                    f"Model '{model}' is paid-only and 'Include paid models' is off. Enable it "
+                    "under Desktop → Settings → Plugins → Pollinations, or pick a Quest-eligible "
+                    "model.", "paid_model_disabled")
 
         # A source image means an edit, which only the enter API can do; the free classic route
         # is text-to-image only, so there is nothing to fall back to. Dedupe order-preserving:
@@ -1977,9 +2662,9 @@ class PollinationsImageGenProvider(ImageGenProvider):
             return _request_failed(exc, action="image generation",
                                    mode=str(extra.get("mode") or "quest"), fail=fail)
         if produced is None:
-            # No announced size (the classic route never sends one): measure a JPEG from its
-            # SOF marker so a server-side clamp is reported honestly.
-            produced = _jpeg_dimensions(data)
+            # No announced size (the classic route never sends one): measure the produced
+            # image structurally (any raster format) so a server-side clamp is reported honestly.
+            produced = _image_dimensions(data, _sniff_image_mime(data))
         if produced is not None:
             # The API announced the produced size (it can clamp oversized requests); report it
             # instead of the requested one, keeping the request alongside for transparency.
@@ -1990,8 +2675,10 @@ class PollinationsImageGenProvider(ImageGenProvider):
             return fail("Pollinations returned an empty body", "empty_response")
         # A 200 can still carry an error body; only save it when it really is an image.
         sniffed = _sniff_image_mime(data)
-        if sniffed is None:
-            return fail("Pollinations returned a non-image response", "invalid_response")
+        if sniffed is None or sniffed not in ACCEPTED_INPUT_MIME:
+            # Raster only: SVG and other active formats are refused as generated output.
+            return fail("Pollinations returned a non-image or non-raster response",
+                        "invalid_response")
         if not _image_is_complete(data, sniffed):
             return fail("Pollinations returned an incomplete image", "invalid_response")
 
@@ -2032,6 +2719,13 @@ class PollinationsImageGenProvider(ImageGenProvider):
                 "Image editing needs a Pollinations API key — the free classic route is "
                 "text-to-image only. Add a key at https://enter.pollinations.ai/keys.",
                 "auth_required")
+        if entry is not None and not _is_image_model(entry):
+            # capabilities() advertises editing only for image entries; generate must agree.
+            return fail(f"Model '{model}' is not an image model and cannot edit images.",
+                        "unsupported")
+        if entry is not None and _is_svg_product(entry):
+            return fail(f"Model '{model}' produces SVG output, which this plugin cannot return.",
+                        "unsupported")
         if not _supports_edits(entry):
             options = _visible_edit_models(_catalog(), include_paid=_include_paid_models(self._plugin_id))
             hint = f" Edit-capable models: {', '.join(options)}." if options else ""
@@ -2053,7 +2747,16 @@ class PollinationsImageGenProvider(ImageGenProvider):
         # budget, and each source is read/encoded under the REMAINING budget (converted back to
         # raw bytes), so a small reference still fits after a large one. Rejecting early keeps
         # transient memory bounded instead of encoding an image that cannot fit.
-        overhead = len(prompt) + 1024
+        # Budget the SERIALIZED fixed fields: JSON escapes (interior newlines, quotes,
+        # control chars) expand the body beyond the raw UTF-8 byte count.
+        fixed_fields: Dict[str, Any] = {
+            "prompt": prompt, "image": [], "model": model, "size": f"{width}x{height}",
+            "seed": seed, "response_format": "b64_json",
+        }
+        requested = str(resolution or "").strip().lower()
+        if requested and requested in _published_resolutions(entry):
+            fixed_fields["resolution"] = requested
+        overhead = len(json.dumps(fixed_fields, ensure_ascii=False).encode("utf-8"))
         try:
             for source in sources:
                 remaining = MAX_EDIT_PAYLOAD_BYTES - total - overhead
@@ -2066,6 +2769,8 @@ class PollinationsImageGenProvider(ImageGenProvider):
                         "prompt). Use fewer or smaller images.", "invalid_input")
                 data_url = _to_data_url(source, limit=raw_limit)
                 total += len(data_url)
+                # Belt-and-suspenders: the remaining-budget conversion above already keeps
+                # the total inside the cap; this re-check guards any future arithmetic drift.
                 if total + overhead > MAX_EDIT_PAYLOAD_BYTES:
                     return fail(
                         f"Those reference images are too large to send "
@@ -2082,18 +2787,14 @@ class PollinationsImageGenProvider(ImageGenProvider):
                         "See the Hermes log for detail.", _network_error_type(exc))
         image = inlined
 
-        payload: Dict[str, Any] = {
-            "prompt": prompt,
-            "image": image,
-            "model": model,
-            "size": f"{width}x{height}",
-            "seed": seed,
-            "response_format": "b64_json",
-        }
-        # Hermes' resolution creative control is only meaningful for models that price by it.
-        requested = str(resolution or "").strip().lower()
-        if requested and requested in _published_resolutions(entry):
-            payload["resolution"] = requested
+        payload: Dict[str, Any] = {**fixed_fields, "image": image}
+        # Exact check on the serialized body the client will send (escapes included), so the
+        # cap holds even when the estimate above and reality drift apart.
+        if len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) > MAX_EDIT_PAYLOAD_BYTES:
+            return fail(
+                "Those reference images are too large to send "
+                f"(limit {MAX_EDIT_PAYLOAD_BYTES // (1024 * 1024)}MB including the prompt). "
+                "Use fewer or smaller images.", "invalid_input")
 
         headers = {"Authorization": f"Bearer {api_key}", "Accept": "application/json"}
         try:
@@ -2116,7 +2817,7 @@ class PollinationsImageGenProvider(ImageGenProvider):
                 message = None
             # Same redaction as the HTTP-error path: a signed URL echoed in a 200 error
             # message must never reach the agent-visible preview.
-            detail = (_text(_URL_RE.sub("[url]", message))
+            detail = (_text(_redact_urls(message))
                       if isinstance(message, str) else "") or "Pollinations reported an error"
             return fail(f"Pollinations could not edit the image: {detail}", "api_error")
         data = answered.get("data")
@@ -2139,6 +2840,7 @@ class PollinationsImageGenProvider(ImageGenProvider):
         url = item.get("url")
         encoded = item.get("b64_json")
         remote = False
+        produced: Optional[tuple[int, int]] = None
         if isinstance(encoded, str) and encoded:
             if encoded.startswith("data:"):  # tolerate a prefixed payload
                 encoded = encoded.partition(",")[2]
@@ -2147,10 +2849,12 @@ class PollinationsImageGenProvider(ImageGenProvider):
             except Exception:
                 return fail("Pollinations returned unreadable image data", "invalid_response")
             sniffed = _sniff_image_mime(raw)
-            if sniffed is None:
-                return fail("Pollinations returned a non-image response", "invalid_response")
+            if sniffed is None or sniffed not in ACCEPTED_INPUT_MIME:
+                return fail("Pollinations returned a non-image or non-raster response",
+                            "invalid_response")
             if not _image_is_complete(raw, sniffed):
                 return fail("Pollinations returned an incomplete image", "invalid_response")
+            produced = _image_dimensions(raw, sniffed)
             try:
                 image_ref = str(save_b64_image(
                     encoded, prefix="pollinations", extension=_extension_for(sniffed, "")))
@@ -2175,6 +2879,11 @@ class PollinationsImageGenProvider(ImageGenProvider):
             return fail("Pollinations returned neither image data nor a URL", "empty_response")
 
         extra = {"width": width, "height": height, "mode": "edit", "sources": len(sources)}
+        if produced is not None:
+            # The edit may be resized server-side; report the measured size, keeping the
+            # request alongside for transparency (URL responses are not fetched: requested).
+            extra["requested_width"], extra["requested_height"] = width, height
+            extra["width"], extra["height"] = produced
         if remote:
             # The bytes were not fetched, so the file may not exist yet or may be unreachable.
             extra["remote"] = True
