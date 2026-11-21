@@ -120,7 +120,8 @@ SPEC_TTL = 86400
 HTTP_TIMEOUT = 120.0
 
 # Source images are inlined into the edits payload as data URIs, so they are capped before the
-# base64 blow-up and restricted to formats every image model accepts.
+# base64 blow-up and restricted to formats every image model accepts. The same raster allowlist
+# gates generated output (SVG and other active formats are refused).
 MAX_INPUT_IMAGE_BYTES = 25 * 1024 * 1024
 ACCEPTED_INPUT_MIME = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"})
 # Hermes' resolution creative control can only express these two values.
@@ -265,11 +266,16 @@ def _ssrf_client(timeout: float, *, follow_redirects: bool = True) -> Any:
     return create_ssrf_safe_client(timeout=timeout, follow_redirects=follow_redirects)
 
 
-def _unwrap_list(payload: Any, keys: tuple) -> Optional[List[Any]]:
+def _unwrap_list(payload: Any, keys: tuple, *,
+                 fallback_item_ok: Optional[Callable[[List[Any]], bool]] = None,
+                 fallback_key_ok: Optional[Callable[[str], bool]] = None) -> Optional[List[Any]]:
     """The first list a JSON envelope carries, preferring the named keys.
 
     Third-party envelopes rename their fields, and a rename must not read as an empty response.
     One level of nesting is followed, so ``{"data": {"models": [...]}}`` resolves too.
+    The positional fallback is additionally gated by the caller's shape predicates, so a
+    name-shaped non-model list (``tags: [{name: "nsfw"}]``) cannot pose as the catalog and a
+    classic envelope must name a models-like key.
     """
     if isinstance(payload, list):
         return payload
@@ -279,7 +285,8 @@ def _unwrap_list(payload: Any, keys: tuple) -> Optional[List[Any]]:
             if isinstance(value, list):
                 return value
             if isinstance(value, dict):
-                inner = _unwrap_list(value, keys)
+                inner = _unwrap_list(value, keys, fallback_item_ok=fallback_item_ok,
+                                     fallback_key_ok=fallback_key_ok)
                 if inner is not None:
                     return inner
         # Positional fallback for a renamed envelope: skip well-known non-model lists and prefer
@@ -288,13 +295,16 @@ def _unwrap_list(payload: Any, keys: tuple) -> Optional[List[Any]]:
         for key, value in payload.items():
             if key in ("errors", "warnings", "messages") or not isinstance(value, list):
                 continue
+            if fallback_key_ok is not None and not fallback_key_ok(key):
+                continue
             if fallback is None:
                 fallback = value
             if any(isinstance(item, dict)
                    and (_valid_id(item.get("name")) or _valid_id(item.get("id")))
                    for item in value):
-                return value
-        if fallback is not None:
+                if fallback_item_ok is None or fallback_item_ok(value):
+                    return value
+        if fallback is not None and (fallback_item_ok is None or fallback_item_ok(fallback)):
             return fallback
     return None
 
@@ -735,8 +745,10 @@ def _catalog() -> List[Dict[str, Any]]:
     # slow failure would hide a cache another thread has already refreshed.
     started = time.time()
     try:
-        models = _unwrap_list(_http_get_json(CATALOG_URL),
-                              ("models", "data", "items", "results")) or []
+        models = _unwrap_list(
+            _http_get_json(CATALOG_URL), ("models", "data", "items", "results"),
+            fallback_item_ok=lambda items: any(isinstance(it, dict) and _is_image_model(it)
+                                               for it in items)) or []
         # Drop non-object entries AND entries without a usable id at the source: a renamed
         # envelope can surface a list that is not models at all, and zero usable ids has the
         # same effect as an empty answer — it must not overwrite a good cache.
@@ -813,7 +825,9 @@ def _classic_models() -> List[str]:
     timeout per window rather than one per call.
     """
     with _CLASSIC_LOCK:
-        if time.time() - float(_CLASSIC_CACHE["at"]) < CATALOG_TTL:
+        age = time.time() - float(_CLASSIC_CACHE["at"])
+        # A future "at" (backward clock step) must not read as permanently fresh.
+        if 0 <= age < CATALOG_TTL:
             return list(_CLASSIC_CACHE["ids"])
         if time.time() < float(_CLASSIC_CACHE.get("negative_until") or 0.0):
             # Another process may have written a good cache while this one was failing.
@@ -824,8 +838,10 @@ def _classic_models() -> List[str]:
     started = time.time()
     fetched_ids: Optional[List[str]] = None
     try:
-        fetched = _unwrap_list(_http_get_json(CLASSIC_MODELS_URL),
-                               ("models", "data", "ids", "items", "results"))
+        fetched = _unwrap_list(
+            _http_get_json(CLASSIC_MODELS_URL), ("models", "data", "ids", "items", "results"),
+            fallback_key_ok=lambda k: "model" in k.lower(),
+            fallback_item_ok=lambda items: any(_valid_id(it) for it in items))
         if fetched is not None:
             # Only guarded strings can become URL path segments; anything else is discarded.
             valid = [item.strip() for item in fetched if _valid_id(item)]
@@ -1151,7 +1167,7 @@ def _is_image_model(model: Dict[str, Any]) -> bool:
         return False
     if category == "image" or "image" in modalities:
         return True
-    return any("image" in str(endpoint).lower()
+    return any(isinstance(endpoint, str) and "image" in endpoint.lower()
                for endpoint in _as_list(model.get("supported_endpoints")))
 
 
@@ -1673,6 +1689,8 @@ def _encode_input_image(raw: bytes) -> str:
     mime = _sniff_image_mime(raw)
     if mime not in ACCEPTED_INPUT_MIME:
         raise ValueError("source image is not a supported PNG, JPEG, GIF or WebP image")
+    if not _image_is_complete(raw, mime):
+        raise ValueError("source image is incomplete or corrupt")
     return f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
 
 
@@ -2181,8 +2199,10 @@ class PollinationsImageGenProvider(ImageGenProvider):
             return fail("Pollinations returned an empty body", "empty_response")
         # A 200 can still carry an error body; only save it when it really is an image.
         sniffed = _sniff_image_mime(data)
-        if sniffed is None:
-            return fail("Pollinations returned a non-image response", "invalid_response")
+        if sniffed is None or sniffed not in ACCEPTED_INPUT_MIME:
+            # Raster only: SVG and other active formats are refused as generated output.
+            return fail("Pollinations returned a non-image or non-raster response",
+                        "invalid_response")
         if not _image_is_complete(data, sniffed):
             return fail("Pollinations returned an incomplete image", "invalid_response")
 
@@ -2338,8 +2358,9 @@ class PollinationsImageGenProvider(ImageGenProvider):
             except Exception:
                 return fail("Pollinations returned unreadable image data", "invalid_response")
             sniffed = _sniff_image_mime(raw)
-            if sniffed is None:
-                return fail("Pollinations returned a non-image response", "invalid_response")
+            if sniffed is None or sniffed not in ACCEPTED_INPUT_MIME:
+                return fail("Pollinations returned a non-image or non-raster response",
+                            "invalid_response")
             if not _image_is_complete(raw, sniffed):
                 return fail("Pollinations returned an incomplete image", "invalid_response")
             try:
