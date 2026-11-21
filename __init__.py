@@ -1011,12 +1011,15 @@ def _store_classic_cache(ids: List[str], started: float) -> List[str]:
                                        started)
         if not written:
             raw = read_json_or_empty(_classic_cache_path())
-            raw_ids = _as_list(raw.get("ids"))
-            valid = [i.strip() for i in raw_ids if _valid_id(i)]
-            if _cache_schema_ok(raw) and (not raw_ids or valid):
-                _classic_state()["ids"] = valid
-                _classic_state()["at"] = float(raw.get("fetched") or started)
-                return valid
+            raw_ids = raw.get("ids")
+            # An explicit list (empty = withdrawal) only; a malformed ids field must not
+            # clear good data.
+            if isinstance(raw_ids, list) and _cache_schema_ok(raw):
+                valid = [i.strip() for i in raw_ids if _valid_id(i)]
+                if not raw_ids or valid:
+                    _classic_state()["ids"] = valid
+                    _classic_state()["at"] = float(raw.get("fetched") or started)
+                    return valid
     except Exception as exc:
         logger.debug("Could not cache the free classic model list: %s", exc)
     return ids
@@ -1032,6 +1035,8 @@ def _adopt_newer_classic_disk(state: Dict[str, Any]) -> None:
         raw = read_json_or_empty(_classic_cache_path())
         if not _cache_schema_ok(raw):
             return
+        if not isinstance(raw.get("ids"), list):
+            return  # a missing/malformed ids field is NOT a withdrawal
         fetched = float(raw.get("fetched") or 0)
         if not math.isfinite(fetched) or fetched <= float(state["at"]):
             return

@@ -140,12 +140,37 @@ def test_non_finite_stamp_repaired():
 def test_backoff_adopts_newer_withdrawal():
     mod = _require()
     _setup(mod)
-    mod._classic_state().update({"at": time.time() - 100, "ids": ["sana"],
+    # The REAL lookup must run (the _setup stub would make this vacuous): restore the
+    # pristine seam, expire memory past the TTL, keep the negative window active, and
+    # fail loudly on any network fetch.
+    setattr(mod, "_classic_models", _PRISTINE["_classic_models"])
+
+    def _boom(url, timeout=30.0):
+        raise AssertionError("network fetch during backoff")
+
+    setattr(mod, "_http_get_json", _boom)
+    mod._classic_state().update({"at": time.time() - 7200, "ids": ["sana"],
                                  "negative_until": time.monotonic() + 60,
                                  "last_success": time.monotonic()})
     mod.atomic_json_write(mod._classic_cache_path(),
                           {"version": 1, "fetched": time.time(), "ids": []})
     assert mod._classic_models() == []
+
+
+def test_malformed_ids_not_a_withdrawal():
+    mod = _require()
+    _setup(mod)
+    setattr(mod, "_classic_models", _PRISTINE["_classic_models"])  # the REAL lookup
+    mod._classic_state().update({"at": time.time() - 10, "ids": ["sana"],
+                                 "negative_until": 0.0, "last_success": 0.0})
+    mod.atomic_json_write(mod._classic_cache_path(),
+                          {"version": 1, "fetched": time.time(), "ids": "invalid"})
+    assert mod._classic_models() == ["sana"]  # fresh memory kept; malformed disk ignored
+    # Store skip path: a newer malformed write must not clear the fetched list either.
+    mod.atomic_json_write(mod._classic_cache_path(),
+                          {"version": 1, "fetched": time.time() + 10, "ids": "invalid"})
+    winner = mod._store_classic_cache(["fresh"], time.time())
+    assert winner == ["fresh"], winner
 
 
 def test_store_returns_newer_disk_winner():
