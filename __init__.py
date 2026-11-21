@@ -33,15 +33,19 @@ reached the plugin skips its client-side pre-checks and lets the server enforce 
 
 Selection: ``model`` kwarg → ``POLLINATIONS_IMAGE_MODEL`` → ``image_gen.pollinations.model``
 → ``image_gen.model`` → the free classic model, else the first Quest-eligible one. Catalog ids
-*and* aliases resolve; an unknown id passes through verbatim, so a model added upstream works
-the day it appears.
+*and* aliases resolve case-insensitively (the catalog's own spelling is restored). An unknown
+id set explicitly, via ``POLLINATIONS_IMAGE_MODEL`` or ``image_gen.pollinations.model`` passes
+through verbatim, so a model added upstream works the day it appears; an unknown shared
+``image_gen.model`` value falls back to the live default instead (usually another provider's
+leftover id), unless the free classic API serves it.
 
 Picker visibility follows the credentials, so the list never offers a model the current setup
 cannot run: no key → the models the free classic API serves (usually one); a key → every
 Quest-eligible model; a key plus the ``include_paid_models`` setting (Desktop → Settings →
 Plugins) → the paid-only catalog too. The setting also gates invocation: a paid-only catalog
-model is refused while it is off, whichever path selected it. The user's saved model is always
-kept visible, so neither change makes it vanish. Rows are ordered by estimated per-image cost:
+model is refused while it is off, whichever path selected it. The user's saved model is kept
+visible whenever the current state can run it (a keyed passthrough id gets a minimal row, and
+a retained paid row is marked disabled), so neither change makes it vanish silently. Rows are ordered by estimated per-image cost:
 per-image and per-megapixel rates are normalized, per-token models follow them, and unpublished
 prices sort last; keyless, the free classic rows lead regardless of any enter price.
 
@@ -591,7 +595,8 @@ def _seed_from(kwargs: Dict[str, Any]) -> int:
 
     The range (including the -1 sentinel) is read from the published spec, so a widened or
     narrowed range follows upstream without a plugin edit; reproducible generations are
-    possible on models that honor seed. A bool is not a seed. Out-of-range or non-integer
+    possible on models that honor seed (direct provider calls only — the image_generate tool
+    exposes no seed parameter). A bool is not a seed. Out-of-range or non-integer
     values fall back to random instead of erroring. When the spec range is unknown the
     caller's int passes through verbatim and the server validates it.
     """
@@ -1340,10 +1345,10 @@ def _price_label(model: Dict[str, Any], free_classic: bool, has_key: bool,
             return "Free on the classic route · watermark · reduced size · no key needed"
         return "Free · watermark · reduced size · no key needed"
     if amount is None:
-        # A title that says "free" describes the free classic route; once a key is set this model
-        # is billed through the enter API, so the label must not imply it is free.
-        cost = ("No published price" if has_key
-                else ("Free pollen" if _advertises_free(model) else "No published price"))
+        # A title that says "free" is marketing copy, not a published price, and a non-classic
+        # model cannot run keyless anyway: both states read "No published price" so the label
+        # never implies free usability the route cannot deliver.
+        cost = "No published price"
     else:
         unit = _pricing_unit(model)
         if unit and unit not in ("image", "images", "generation", "token", "tokens"):
@@ -1465,10 +1470,11 @@ def _derived_default(catalog: List[Dict[str, Any]], classic: set,
             continue
         if _is_free_classic(model, classic):
             # A free-classic model the catalog also marks paid-only is still usable keyless, but
-            # a plainly free one is the better default.
+            # a plainly free one is the better default. Keyed, generate() refuses paid-only
+            # models while the toggle is off, so they are no derived default at all.
             if _paid_flag(model) is False:
                 return name
-            if free_fallback is None:
+            if free_fallback is None and not has_key:
                 free_fallback = name
         if fallback is None and has_key and _paid_flag(model) is False:
             fallback = name
@@ -1875,8 +1881,9 @@ class PollinationsImageGenProvider(ImageGenProvider):
         models follow them (no published token count to compare with), and unpublished prices
         sort last. No key → the free classic model only. Key → every Quest-eligible model. Key
         plus the ``include_paid_models`` setting → the paid-only catalog too. The user's saved
-        model is always kept visible, so removing the key or turning the setting off never makes
-        a configured model silently disappear.
+        model is kept visible whenever the current state can run it (a keyed passthrough id gets
+        a minimal row; a retained paid row is marked disabled), so removing the key or turning
+        the setting off never makes a runnable configured model silently disappear.
         """
         catalog = _catalog()
         classic = _classic_set()
@@ -1895,11 +1902,14 @@ class PollinationsImageGenProvider(ImageGenProvider):
                 logger.debug("Pollinations catalog lists %r more than once; keeping the first.", name)
                 continue
             free_classic = _is_free_classic(model, classic)
-            if not free_classic:
-                if not has_key:
+            if not has_key:
+                if not free_classic:
                     continue  # state 1: the free classic API is the only keyless route
-                if _paid_flag(model) is not False and not include_paid:
-                    continue  # state 2: Quest-eligible only (unreadable flags stay hidden)
+            elif _paid_flag(model) is not False and not include_paid:
+                # state 2: Quest-eligible only (unreadable flags stay hidden). Keyed, a
+                # paid-only model is refused by generate() even when classic serves it, so
+                # it must not be offered here either.
+                continue
             rows[name] = _specs(model, free_classic, has_key)
             seen_lower.add(name.lower())
 
@@ -1918,11 +1928,16 @@ class PollinationsImageGenProvider(ImageGenProvider):
         configured = _configured_model(catalog)
         if configured and configured not in rows and configured.lower() not in seen_lower:
             saved = next((m for m in catalog if _name_of(m) == configured), None)
-            if saved is not None and not _is_video_model(saved):
+            if saved is not None:
                 # Retention keeps the user's saved model visible — but never a video entry:
                 # the picker offers image models only, matching capabilities() and generate().
-                rows[configured] = _specs(saved, _is_free_classic(saved, classic), has_key)
-                seen_lower.add(configured.lower())
+                if not _is_video_model(saved):
+                    rows[configured] = _specs(saved, _is_free_classic(saved, classic), has_key)
+                    if has_key and _paid_flag(saved) is not False and not include_paid:
+                        # Say plainly that generate() will refuse this row until the toggle
+                        # is on, rather than offering an unrunnable choice unexplained.
+                        rows[configured]["price"] += " · disabled (paid toggle off)"
+                    seen_lower.add(configured.lower())
             elif _valid_id(configured) and configured.lower() in classic:
                 # A saved classic-only model the catalog omits: the classic route can still run
                 # it (keyed included), so keep the user's choice visible with an honest label.
@@ -1930,6 +1945,13 @@ class PollinationsImageGenProvider(ImageGenProvider):
                 rows[spelling] = _specs({"name": spelling, "input_modalities": ["text"]},
                                         True, has_key, classic_route=True)
                 seen_lower.add(spelling.lower())
+            elif has_key and _valid_id(configured):
+                # A saved passthrough id the catalog does not list: keyed it still runs, so
+                # keep the user's choice visible with an honest minimal row. Keyless it
+                # cannot run unless classic serves it (the branch above).
+                rows[configured] = _specs({"name": configured, "input_modalities": ["text"]},
+                                          False, has_key)
+                seen_lower.add(configured.lower())
 
         def _order(row: Dict[str, Any]) -> tuple:
             if not has_key and row["free_classic"]:
@@ -1940,8 +1962,18 @@ class PollinationsImageGenProvider(ImageGenProvider):
         return catalog_rows({row["id"]: row for row in ordered}, fields=MODEL_FIELDS)
 
     def default_model(self) -> Optional[str]:
-        """The free classic model, else the first Quest-eligible one — both read live."""
-        return _derived_default(_catalog(), _classic_set(), _api_key() is not None)
+        """The resolved configured model when one is set, else the live-derived default.
+
+        Returning the configured model keeps the CLI picker's "currently in use" marker on
+        the right row for saved aliases/case variants (the core compares the raw config value
+        against row ids and falls back to this method). With nothing configured, the free
+        classic model leads, else the first Quest-eligible one — both read live.
+        """
+        catalog = _catalog()
+        configured = _configured_model(catalog)
+        if configured:
+            return configured
+        return _derived_default(catalog, _classic_set(), _api_key() is not None)
 
     def capabilities(self) -> Dict[str, Any]:
         """What the configured model can do, every part read from the live catalog.
@@ -1958,6 +1990,11 @@ class PollinationsImageGenProvider(ImageGenProvider):
         catalog = _catalog()
         entry = _catalog_entry(catalog, _configured_model(catalog))
         if not _is_image_model(entry):
+            entry = None
+        if (entry is not None and _paid_flag(entry) is not False
+                and not _include_paid_models(self._plugin_id)):
+            # generate() refuses this model while the toggle is off; the schema must not
+            # advertise edits/resolution the call cannot perform.
             entry = None
         capabilities: Dict[str, Any] = {"modalities": ["text"], "max_reference_images": 0}
         if _supports_resolution(entry):
