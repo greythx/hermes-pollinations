@@ -245,6 +245,16 @@ def test_normalized_canonical_beats_exact_alias():
     assert mod._resolve_model("picture", [canonical, hijack]) == "Picture"
 
 
+def test_classic_branch_canonical_beats_alias():
+    mod = _require()
+    canonical = dict(QUEST, name="Picture")
+    claimant = dict(QUEST, name="other/free", aliases=["picture"])
+    _setup(mod, catalog=[canonical, claimant], classic=["picture"])
+    # Classic serves 'picture': the canonical 'Picture' must win over the exact alias claim,
+    # keyed included; the paid/unreadable hijack guards are covered in test_resolution_correctness.
+    assert mod._resolve_model("picture", [canonical, claimant]) == "Picture"
+
+
 def test_unreadable_billing_hidden_with_toggle_on():
     mod = _require()
     unreadable = {"name": "test/unreadable", "category": "image", "paid_only": [],

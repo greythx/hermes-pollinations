@@ -2023,8 +2023,13 @@ def _resolve_model(explicit: Optional[str], catalog: List[Dict[str, Any]]) -> Op
             if key in spelling:
                 # A classic-served id keeps the endpoint's own spelling unless a readable,
                 # non-paid image entry legitimately claims it as an alias. A paid (or
-                # unreadable) entry must not hijack the user's free model.
-                target = index.get(wanted) or folded.get(key)
+                # unreadable) entry must not hijack the user's free model. A normalized
+                # CANONICAL beats an exact alias claim here too (same rule as below).
+                canonical = folded.get(key)
+                if canonical is not None and any(_name_of(m) == canonical for m in catalog):
+                    target = canonical
+                else:
+                    target = index.get(wanted) or folded.get(key)
                 entry = _catalog_entry(catalog, target) if target else None
                 if entry is not None and _is_image_model(entry) and _paid_flag(entry) is False:
                     return target
