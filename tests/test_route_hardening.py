@@ -122,14 +122,16 @@ def test_produced_dimensions_reported():
     assert res["requested_width"] == 1024 and res["requested_height"] == 1024, res
 
 
-def test_requested_dimensions_kept_without_header():
+def test_measured_dimensions_reported_without_header():
     mod = _require()
     _route_setup(mod, catalog=[dict(QUEST)], classic=[])
     res = mod.PollinationsImageGenProvider().generate(
         "a cat", aspect_ratio="square", model="test/quest-model")
     assert res["success"] is True, res
-    assert res["width"] == 1024 and res["height"] == 1024, res
-    assert "requested_width" not in res, res
+    # No X-Image-Dimensions header: the produced size is measured from the image bytes
+    # (the fake PNG is 1x1), keeping the requested size alongside for transparency.
+    assert res["width"] == 1 and res["height"] == 1, res
+    assert res["requested_width"] == 1024 and res["requested_height"] == 1024, res
 
 
 def test_t2i_seed_kwarg_honored():

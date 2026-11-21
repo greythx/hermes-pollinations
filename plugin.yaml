@@ -10,7 +10,7 @@ tags:
   - pollinations
   - image-editing
 requires_hermes: ">=0.21.6"
-requires_env:
+optional_env:
   - name: POLLINATIONS_API_KEY
     description: "Optional — unlocks the full catalog picker, clean (unwatermarked) generation and image editing; the free classic model works without it"
     url: https://enter.pollinations.ai/keys

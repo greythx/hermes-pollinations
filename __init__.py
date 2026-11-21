@@ -152,6 +152,9 @@ NEGATIVE_TTL = 60.0
 # a safe default within the current spec, not a claim about it. Caller seeds are validated
 # against the range read live from the published OpenAPI spec.
 _RANDOM_SEED_MAX = 2**31 - 1
+# Client sanity ceiling: a hostile/absurd published range must not put 400-digit seeds into
+# URLs; the live range stays authoritative within sane bounds.
+_SEED_SANITY_MAX = 2**63 - 1
 # Picker column widths: strengths is truncated to keep the row readable.
 STRENGTHS_LIMIT = 120
 # How many edit-capable models an error message names.
@@ -201,7 +204,8 @@ def _api_key() -> Optional[str]:
 
     for name in API_KEY_ENVS:
         try:
-            value = str(get_secret(name) or "").strip()
+            secret = get_secret(name)
+            value = secret.strip() if isinstance(secret, str) else ""
         except UnscopedSecretError:
             # Deliberate keyless degradation, but under multiplexing this can also mean a
             # spawn-site scoping bug: warn once so it is visible, then stay quiet.
@@ -369,6 +373,10 @@ def _retry_after(response: Any) -> Optional[int]:
     """The ``Retry-After`` header in seconds, as a delay or an HTTP-date."""
     raw = (response.headers.get("retry-after") or "").strip()
     try:
+        # ASCII decimal shape only, mirroring the price parser: float() alone would read
+        # '1_0' and non-ASCII digits as delays.
+        if not re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", raw, re.ASCII):
+            raise ValueError(raw)
         return min(RETRY_AFTER_MAX, max(0, int(float(raw))))
     except (TypeError, ValueError, OverflowError):
         pass
@@ -401,20 +409,17 @@ def _read_prefix(response: Any, limit: int) -> bytes:
     return b"".join(chunks)
 
 
-# URLs in raw error text can be JSON-escaped (https:\/\/ or https:\/), and a JSON string
-# embedded in another JSON string doubles the backslashes (https:\\/\\/). The redaction
-# matches any number of backslashes before each slash (or \u002f spell), and stops at
-# whitespace or a quote so a compact JSON body does not redact past the string it is in.
-# URLs in error text may be JSON-escaped (https:\/\/), double-escaped, or unicode-escaped
-    # in ANY scheme character (\u0068ttps\u003a//). Decode those spellings first (bounded
-# passes), strip control characters that could split a URL, then redact. The tail allows
-# apostrophes (a legal URL character) and stops at whitespace, double quotes and backslashes;
-# protocol-relative //host URLs are redacted too.
+# URLs in raw error text can be JSON-escaped (https:\/\/), double-escaped, or unicode-
+# escaped in ANY scheme character (\u0068ttps\u003a//). _redact_urls decodes those spellings
+# (bounded passes), strips control characters that could split a URL, then matches http(s)
+# and protocol-relative // URLs whose tail allows apostrophes and stops at whitespace,
+# double quotes and backslashes; bare credential query tails are masked separately.
 _ESCAPE_RE = re.compile(r"\\+u([0-9a-fA-F]{4})|\\+(/)")
 _URL_RE = re.compile(r"(?:https?:)?//[^\s\"\\]*", re.IGNORECASE)
 _SECRET_TAIL_RE = re.compile(
-    r"([?&](?:sig|signature|token|access_token|api_key|apikey|key|x-amz-[a-z0-9-]+)=)"
-    r"[^\s\"&'\\]*", re.IGNORECASE)
+    r"([?&](?:sig|signature|token|access_token|accessToken|access-token|api_key|api-key|apikey|"
+    r"key|password|secret|auth|credential|client_secret|refresh_token|x-amz-[a-z0-9-]+)=)"
+    r"[^\s\"&\\]*", re.IGNORECASE)
 # Display clamp for an absurd Retry-After, not an API fact.
 RETRY_AFTER_MAX = 86400
 
@@ -436,7 +441,7 @@ def _redact_urls(text: str) -> str:
     split it into unrecognizable halves); the preview shows the decoded, redacted text.
     """
     prev = None
-    for _ in range(3):
+    for _ in range(6):
         if text == prev:
             break
         prev = text
@@ -449,8 +454,8 @@ def _redact_urls(text: str) -> str:
 def _error_fields(response: Any) -> tuple[Optional[str], str, Optional[str]]:
     """The upstream error code, a short redacted preview, and the published fixUrl (if any).
 
-    The FULL bounded body is parsed before any truncation: cutting first would break json.loads
-    on a long body and leak sibling fields (such as signed URLs) through the raw-text fallback.
+    The 64KB bounded prefix is parsed before the 200-char preview cut; oversized bodies fall
+    back to URL-redacted raw text (a signed URL must never reach the preview on ANY path).
     A JSON error body is reduced to its ``error.message``; anything else has its URLs redacted.
     fixUrl is read live from the envelope (the spec publishes it per error) so guidance can
     point at the upstream fix page instead of a hardcoded constant.
@@ -477,8 +482,14 @@ def _error_fields(response: Any) -> tuple[Optional[str], str, Optional[str]]:
                 message = err["message"]
             candidate = err.get("fixUrl")
             if (isinstance(candidate, str) and candidate.startswith("https://")
-                    and len(candidate) <= 2048 and candidate.isprintable()):
-                fix_url = candidate
+                    and len(candidate) <= 2048 and candidate.isprintable()
+                    and not any(ch.isspace() for ch in candidate)):
+                # Guidance, not payload: drop query/fragment (credential tails) and reject
+                # userinfo so nothing sensitive or injectable reaches the agent-visible error.
+                base = candidate.split("?", 1)[0].split("#", 1)[0]
+                authority = base[len("https://"):].split("/", 1)[0]
+                if "@" not in authority:
+                    fix_url = base
         elif isinstance(err, str):
             message = err
     if message is None:
@@ -750,9 +761,9 @@ def _seed_from(kwargs: Dict[str, Any]) -> int:
     limits = _spec_limits()
     lo, hi = limits["seed_min"], limits["seed_max"]
     if isinstance(raw, int) and not isinstance(raw, bool):
-        if lo is None or hi is None or lo <= raw <= hi:
+        if (lo is None or hi is None or lo <= raw <= hi) and abs(raw) <= _SEED_SANITY_MAX:
             return raw
-    top = hi if hi is not None else _RANDOM_SEED_MAX
+    top = min(hi, _SEED_SANITY_MAX) if hi is not None else _RANDOM_SEED_MAX
     bottom = max(0, lo) if lo is not None else 0
     if bottom > top:
         # A negative-only published range cannot host a nonnegative random seed: return the
@@ -819,7 +830,11 @@ def _guarded_cache_write(path: Path, payload: Dict[str, Any], started: float) ->
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
             try:
                 disk = read_json_or_empty(path)
-                if float(disk.get("fetched") or 0) > started:
+                try:
+                    disk_fetched = float(disk.get("fetched") or 0)
+                except (TypeError, ValueError, OverflowError):
+                    disk_fetched = 0.0  # a corrupt stamp must not immortalize the file
+                if disk_fetched > started:
                     return  # a newer write landed mid-fetch
                 atomic_json_write(path, payload)
             finally:
@@ -951,8 +966,13 @@ def _classic_models() -> List[str]:
             try:
                 raw = read_json_or_empty(_classic_cache_path())
                 if _cache_schema_ok(raw) and float(raw.get("fetched") or 0) > float(state["at"]):
-                    state["ids"] = [i.strip() for i in _as_list(raw.get("ids")) if _valid_id(i)]
-                    state["at"] = float(raw["fetched"])
+                    raw_ids = _as_list(raw.get("ids"))
+                    valid = [i.strip() for i in raw_ids if _valid_id(i)]
+                    # Adopt a withdrawal (empty) or a usable list; non-empty with zero valid
+                    # ids is hostile/corrupt — keep memory (mirrors the live-fetch guard).
+                    if not raw_ids or valid:
+                        state["ids"] = valid
+                        state["at"] = float(raw["fetched"])
             except Exception:
                 pass
             return list(state["ids"])
@@ -989,7 +1009,7 @@ def _classic_models() -> List[str]:
             if started_mono >= float(_classic_state().get("last_success") or 0.0):
                 _store_classic_cache(fetched_ids, started)
                 _classic_state()["ids"] = list(fetched_ids)
-                _classic_state()["at"] = time.time()
+                _classic_state()["at"] = started
                 _classic_state()["negative_until"] = 0.0
                 # START token, not completion time (see _catalog): later-started wins.
                 _classic_state()["last_success"] = started_mono
@@ -1025,7 +1045,7 @@ def _free_route_unavailable() -> bool:
     told their model is unavailable when the endpoint is simply down.
     """
     with _CLASSIC_LOCK:
-        return time.time() < float(_classic_state().get("negative_until") or 0.0)
+        return time.monotonic() < float(_classic_state().get("negative_until") or 0.0)
 
 
 def _spec_cache_path() -> Path:
@@ -1316,8 +1336,10 @@ def _classic_keys(model: Dict[str, Any]) -> List[str]:
     """
     if not isinstance(model, dict):
         return []
-    return [key for key in [_name_of(model), *_as_list(model.get("aliases"))]
-            if isinstance(key, str)]
+    # Aliases get the same _text cleaning as the index, so a whitespace-padded alias
+    # still matches the classic set.
+    keys = [_name_of(model)] + [_text(a) for a in _as_list(model.get("aliases"))]
+    return [key for key in keys if isinstance(key, str) and key]
 
 
 def _is_free_classic(model: Dict[str, Any], classic: set) -> bool:
@@ -1347,7 +1369,9 @@ def _edit_path(entry: Optional[Dict[str, Any]]) -> Optional[str]:
         if not isinstance(endpoint, str):
             continue
         candidate = endpoint.strip().split("?", 1)[0].split("#", 1)[0].strip()
-        if candidate.lower().endswith("/edits"):
+        # An IMAGE edits endpoint only: /v1/audio/edits must not enable image editing.
+        # The version segment stays flexible (/v2/images/edits follows upstream).
+        if re.search(r"/images?/edits$", candidate, re.IGNORECASE):
             return candidate
     return None
 
@@ -1388,6 +1412,8 @@ def _edit_url(entry: Optional[Dict[str, Any]]) -> str:
     # A relative path may carry its own query or fragment; neither belongs in an endpoint we
     # construct, and a fragment would silently truncate the path for urlsplit-based consumers.
     clean = path.split("?", 1)[0].split("#", 1)[0]
+    if any(seg == ".." for seg in clean.split("/")):
+        return EDIT_URL  # dot-segments could normalize to another path; do not guess
     return ENTER_BASE_URL + (clean if clean.startswith("/") else "/" + clean)
 
 
@@ -1471,6 +1497,8 @@ def _adjustments_per_image(model: Dict[str, Any]) -> float:
     """
     total = 0.0
     for adj in _image_adjustments(model):
+        if _as_dict(adj.get("option")).get("default") is False:
+            continue  # an optional fee that is off by default is not part of the floor
         unit = _text(adj.get("unit")).lower()
         if unit not in ("", "generation", "image", "images"):
             continue
@@ -1567,7 +1595,7 @@ def _advertises_free(model: Dict[str, Any]) -> bool:
     """
     if _as_number(_as_dict(model.get("pricing")).get("completionImageTokens")) == 0:
         return True
-    text = f"{model.get('title') or ''} {model.get('name') or ''}"
+    text = f"{_text(model.get('title'))} {_text(model.get('name'))}"
     return re.search(r"\bfree\b", text, re.IGNORECASE) is not None
 
 
@@ -1608,6 +1636,9 @@ def _price_label(model: Dict[str, Any], free_classic: bool, has_key: bool,
     pricing = _as_dict(model.get("pricing"))
     unit = _pricing_unit(model)
     flat = unit in ("", "image", "images", "generation") and _as_bool(model.get("flat_rate"))
+    adjustments = _image_adjustments(model)
+    fees = _adjustments_per_image(model)
+    folded = False  # whether convertible fees are included in the displayed figure
     if amount is None:
         # No image rate published: text-token rates still mean per-token billing; a name that
         # says "free" is marketing copy, not a published price, so both states agree.
@@ -1615,31 +1646,42 @@ def _price_label(model: Dict[str, Any], free_classic: bool, has_key: bool,
                      if _as_number(pricing.get("completionTextTokens")) is not None
                      else _as_number(pricing.get("promptTextTokens")))
         cost = "charged per token" if text_rate is not None else "No published price"
+    elif amount == 0:
+        # A published zero is Free whatever the unit/flat flag; convertible fees still apply.
+        cost = _format_price(fees, currency)
+        folded = True
+    elif unit == "megapixel":
+        # rate x quantity is the published per-unit figure — show it (no area assumption).
+        cost = f"≈{_format_price(amount * _pricing_quantity(model), currency)} per megapixel"
     elif unit and unit not in ("image", "images", "generation", "token", "tokens"):
-        # e.g. "megapixel" or "byte": the published figure is per unit, not per image.
-        cost = f"charged per {unit}"
+        # e.g. "byte": a generic per-unit charge, display-bounded like every label field.
+        cost = f"charged per {unit[:32]}"
     elif not flat or unit in ("token", "tokens"):
         cost = "charged per token"
     else:
         # The per-image figure includes convertible per-generation fees so the label and the
         # sort estimate agree.
-        cost = _format_price(amount + _adjustments_per_image(model), currency)
+        cost = _format_price(amount + fees, currency)
+        folded = True
     # A model priced per variant (a 2K tier, an edit operation) can cost more than the base
-    # figure the picker shows, so mark that the figure is a floor — whatever the billing unit.
+    # figure the picker shows: a numeric floor reads "from X"; a per-unit figure says so.
     if _as_list(model.get("pricing_variants")):
         if cost == "Free":
             cost = "Free base (variants may cost more)"
+        elif cost.startswith("≈") or cost.startswith("charged per"):
+            cost = f"{cost} (variants may cost more)"
         elif cost != "No published price":
             cost = f"from {cost}"
     parts = [cost]
-    adjustments = _image_adjustments(model)
-    if adjustments and (not flat or any(
+    if adjustments and (not folded or any(
             _text(a.get("unit")).lower() not in ("", "generation", "image", "images")
             or _text(a.get("currency")).lower() not in ("", "pollen")
             for a in adjustments)):
         parts.append("fees extra")
-    if has_key and _as_number(pricing.get("promptImageTokens")) is not None:
-        parts.append("input billed")
+    if has_key:
+        input_rate = _as_number(pricing.get("promptImageTokens"))
+        if input_rate is not None and input_rate > 0:
+            parts.append("input billed")
     if free_classic:
         parts.append("no watermark")
     if has_key and _supports_edits(model):
@@ -1725,6 +1767,18 @@ def _folded_index(catalog: List[Dict[str, Any]]) -> Dict[str, str]:
     return out
 
 
+def _has_t2i_signal(model: Dict[str, Any]) -> bool:
+    """True when the entry can run text-to-image: a non-edits image endpoint, or no endpoints
+    published at all (the category signal alone). An edits-only entry needs a source image,
+    so it must not become the preselected default."""
+    endpoints = [e for e in _as_list(model.get("supported_endpoints")) if isinstance(e, str)]
+    if not endpoints:
+        return True
+    return any("/image" in e.lower()
+               and not e.lower().split("?", 1)[0].rstrip("/").endswith("/edits")
+               for e in endpoints)
+
+
 def _derived_default(catalog: List[Dict[str, Any]], classic: set,
                      has_key: bool = False) -> Optional[str]:
     """The model to preselect: the one the free classic API serves, else the first Quest-eligible.
@@ -1753,13 +1807,18 @@ def _derived_default(catalog: List[Dict[str, Any]], classic: set,
                 return name
             if free_fallback is None and not has_key:
                 free_fallback = name
-        if fallback is None and has_key and _paid_flag(model) is False:
+        if fallback is None and has_key and _paid_flag(model) is False and _has_t2i_signal(model):
             fallback = name
     if free_fallback:
         return free_fallback
     if fallback:
         return fallback
     classic_ids = _classic_models()
+    if has_key:
+        # A classic id the catalog classifies paid-only (or unreadable) is refused by
+        # generate() keyed; keep only unclassified ids (classic route) and free ones.
+        classic_ids = [cid for cid in classic_ids
+                       if _paid_flag(_catalog_entry(catalog, cid)) is False]
     return classic_ids[0] if classic_ids else None
 
 
@@ -2218,6 +2277,8 @@ class PollinationsImageGenProvider(ImageGenProvider):
                         # Say plainly that generate() will refuse this row until the toggle
                         # is on, rather than offering an unrunnable choice unexplained.
                         rows[configured]["price"] += " · disabled (paid toggle off)"
+                    if not has_key and not _is_free_classic(saved, classic):
+                        rows[configured]["price"] += " · disabled (needs a key)"
                     seen_lower.add(configured.lower())
             elif _valid_id(configured) and configured.lower() in classic:
                 # A saved classic-only model the catalog omits: the classic route can still run
@@ -2388,9 +2449,9 @@ class PollinationsImageGenProvider(ImageGenProvider):
             return _request_failed(exc, action="image generation",
                                    mode=str(extra.get("mode") or "quest"), fail=fail)
         if produced is None:
-            # No announced size (the classic route never sends one): measure a JPEG from its
-            # SOF marker so a server-side clamp is reported honestly.
-            produced = _jpeg_dimensions(data)
+            # No announced size (the classic route never sends one): measure the produced
+            # image structurally (any raster format) so a server-side clamp is reported honestly.
+            produced = _image_dimensions(data, _sniff_image_mime(data))
         if produced is not None:
             # The API announced the produced size (it can clamp oversized requests); report it
             # instead of the requested one, keeping the request alongside for transparency.
@@ -2445,6 +2506,10 @@ class PollinationsImageGenProvider(ImageGenProvider):
                 "Image editing needs a Pollinations API key — the free classic route is "
                 "text-to-image only. Add a key at https://enter.pollinations.ai/keys.",
                 "auth_required")
+        if entry is not None and not _is_image_model(entry):
+            # capabilities() advertises editing only for image entries; generate must agree.
+            return fail(f"Model '{model}' is not an image model and cannot edit images.",
+                        "unsupported")
         if not _supports_edits(entry):
             options = _visible_edit_models(_catalog(), include_paid=_include_paid_models(self._plugin_id))
             hint = f" Edit-capable models: {', '.join(options)}." if options else ""

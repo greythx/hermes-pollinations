@@ -6,8 +6,9 @@ image-gen backend. It works with no account. A key unlocks the full catalog.
 ## Three states
 
 The picker lists only models your current setup can run — except your saved model,
-which stays visible whenever the current state can run it (a retained paid row is marked
-disabled). Generation still refuses what the current state forbids.
+which stays visible even when the current state cannot run it, marked disabled so the
+picker never offers an unexplained dead choice. Generation still refuses what the current
+state forbids.
 
 | State | What you get |
 | --- | --- |
@@ -65,9 +66,9 @@ can express (1K/2K).
 ## Disclosure
 
 - Generation and catalog requests go to `gen.pollinations.ai` or `image.pollinations.ai`.
-  Edit results returned as URLs are cached from the host Pollinations names (such as
-  `media.pollinations.ai`), and reference-image URLs you supply are fetched from their own
-  hosts through the SSRF guard.
+  Edit results returned as URLs are cached from whatever public host the response names
+  (often `media.pollinations.ai`), through the SSRF guard with no credentials sent;
+  reference-image URLs you supply are fetched from their own hosts the same way.
 - The edits endpoint is pinned to `gen.pollinations.ai`: a model entry that advertises an edits
   URL on another host, over plain HTTP, or on a non-standard port is ignored and the Pollinations
   endpoint is used instead, so your key and reference images only ever leave for Pollinations.
@@ -85,7 +86,8 @@ can express (1K/2K).
   refused at generation time until you turn the toggle on. A model id the catalog does not
   list cannot be classified and is sent as-is (with the shared-config exception above).
 - There is no telemetry or analytics. Outbound traffic is limited to the Pollinations API
-  calls listed above and the reference-image hosts you supply.
+  calls listed above, the public hosts named by edit-result URLs, and the reference-image
+  hosts you supply — all public-only through the SSRF guard.
 
 ## License
 

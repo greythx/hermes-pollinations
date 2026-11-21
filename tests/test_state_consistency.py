@@ -164,7 +164,9 @@ def test_future_aspect_ratio_degrades_to_square():
     try:
         res = mod.PollinationsImageGenProvider().generate("a cat", model="test/quest-model")
         assert res["success"] is True, res
-        assert res["width"] == 1024 and res["height"] == 1024, res
+        # The unknown aspect fell back to square (requested 1024); the fake 1x1 PNG is
+        # measured and reported as produced.
+        assert res["requested_width"] == 1024 and res["requested_height"] == 1024, res
     finally:
         setattr(mod, "resolve_aspect_ratio", orig_aspect)
         if orig_get_image is not None:

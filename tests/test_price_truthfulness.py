@@ -77,7 +77,7 @@ def test_megapixel_fee_hint_and_estimate():
     expected = 0.00000002 * 1000000 * mod._TYPICAL_MP + 0.01
     assert abs(mod._price_value(m) - expected) < 1e-9, mod._price_value(m)
     label = mod._price_label(m, False, True)
-    assert "charged per megapixel" in label, label
+    assert "per megapixel" in label, label
     assert "fees extra" in label, label
 
 
@@ -109,7 +109,7 @@ def test_from_marker_unit_independent():
     mp = _model("0.00000002", flat_rate=False,
                 pricing_units={"completionImageTokens": {"unit": "megapixel", "quantity": 1000000}},
                 pricing_variants=[{"name": "edit"}])
-    assert mod._price_label(mp, False, True).startswith("from charged per megapixel"), \
+    assert "variants may cost more" in mod._price_label(mp, False, True), \
         mod._price_label(mp, False, True)
     flat = _model("0.002", pricing_variants=[{"name": "2k"}])
     assert mod._price_label(flat, False, True).startswith("from 0.002 pollen")
