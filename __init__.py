@@ -325,27 +325,29 @@ class _HTTPError(Exception):
 
     def __init__(self, url: str, status: int, body: str = "",
                  retry_after: Optional[int] = None,
-                 error_code: Optional[str] = None) -> None:
+                 error_code: Optional[str] = None,
+                 fix_url: Optional[str] = None) -> None:
         super().__init__(f"HTTP {status} from {url}")
         self.url = url
         self.status = status
         self.body = body
         self.retry_after = retry_after
         self.error_code = error_code
+        self.fix_url = fix_url
 
 
 def _retry_after(response: Any) -> Optional[int]:
     """The ``Retry-After`` header in seconds, as a delay or an HTTP-date."""
     raw = (response.headers.get("retry-after") or "").strip()
     try:
-        return max(0, int(float(raw)))
+        return min(RETRY_AFTER_MAX, max(0, int(float(raw))))
     except (TypeError, ValueError, OverflowError):
         pass
     try:
         from email.utils import parsedate_to_datetime
 
         delta = parsedate_to_datetime(raw) - datetime.now(timezone.utc)
-        return max(0, int(delta.total_seconds()))
+        return min(RETRY_AFTER_MAX, max(0, int(delta.total_seconds())))
     except Exception:
         return None
 
@@ -374,25 +376,65 @@ def _read_prefix(response: Any, limit: int) -> bytes:
 # embedded in another JSON string doubles the backslashes (https:\\/\\/). The redaction
 # matches any number of backslashes before each slash (or \u002f spell), and stops at
 # whitespace or a quote so a compact JSON body does not redact past the string it is in.
-_URL_SLASH = r"(?:\\*/|\\*u002[fF])"
-_URL_RE = re.compile(r"https?:" + _URL_SLASH + r"{2}[^\s\"']*", re.IGNORECASE)
+# URLs in error text may be JSON-escaped (https:\/\/), double-escaped, or unicode-escaped
+    # in ANY scheme character (\u0068ttps\u003a//). Decode those spellings first (bounded
+# passes), strip control characters that could split a URL, then redact. The tail allows
+# apostrophes (a legal URL character) and stops at whitespace, double quotes and backslashes;
+# protocol-relative //host URLs are redacted too.
+_ESCAPE_RE = re.compile(r"\\+u([0-9a-fA-F]{4})|\\+(/)")
+_URL_RE = re.compile(r"(?:https?:)?//[^\s\"\\]*", re.IGNORECASE)
+_SECRET_TAIL_RE = re.compile(
+    r"([?&](?:sig|signature|token|access_token|api_key|apikey|key|x-amz-[a-z0-9-]+)=)"
+    r"[^\s\"&'\\]*", re.IGNORECASE)
+# Display clamp for an absurd Retry-After, not an API fact.
+RETRY_AFTER_MAX = 86400
 
 
-def _error_fields(response: Any) -> tuple[Optional[str], str]:
-    """The upstream error code and a short, control-character-free preview, safe for the agent.
+def _unescape_match(match: Any) -> str:
+    if match.group(2) is not None:
+        return "/"
+    cp = int(match.group(1), 16)
+    if 0xD800 <= cp <= 0xDFFF:
+        return ""  # a lone surrogate is not displayable text
+    return chr(cp)
+
+
+def _redact_urls(text: str) -> str:
+    """Decode escape spellings, then redact URLs and bare credential query tails.
+
+    Shared by the HTTP-error and in-band 200 edit-error paths so no path can leak a signed
+    URL. Control characters are removed BEFORE matching (one hidden inside a URL must not
+    split it into unrecognizable halves); the preview shows the decoded, redacted text.
+    """
+    prev = None
+    for _ in range(3):
+        if text == prev:
+            break
+        prev = text
+        text = _ESCAPE_RE.sub(_unescape_match, text)
+    text = "".join(ch for ch in text if ch.isprintable() or ch in " \t")
+    text = _URL_RE.sub("[url]", text)
+    return _SECRET_TAIL_RE.sub(r"\1[redacted]", text)
+
+
+def _error_fields(response: Any) -> tuple[Optional[str], str, Optional[str]]:
+    """The upstream error code, a short redacted preview, and the published fixUrl (if any).
 
     The FULL bounded body is parsed before any truncation: cutting first would break json.loads
     on a long body and leak sibling fields (such as signed URLs) through the raw-text fallback.
     A JSON error body is reduced to its ``error.message``; anything else has its URLs redacted.
+    fixUrl is read live from the envelope (the spec publishes it per error) so guidance can
+    point at the upstream fix page instead of a hardcoded constant.
     """
     raw_bytes = _read_prefix(response, 64 * 1024)
     if _sniff_image_mime(raw_bytes) is not None:
         # An error status can carry an image body (the classic route does this when unhealthy);
         # never echo binary garbage into the agent-visible preview.
-        return None, "(non-text error body)"
+        return None, "(non-text error body)", None
     raw = raw_bytes.decode("utf-8", "replace")
     code: Optional[str] = None
     message: Optional[str] = None
+    fix_url: Optional[str] = None
     try:
         payload = json.loads(raw)
     except Exception:
@@ -404,15 +446,18 @@ def _error_fields(response: Any) -> tuple[Optional[str], str]:
                 code = err["code"]
             if isinstance(err.get("message"), str):
                 message = err["message"]
+            candidate = err.get("fixUrl")
+            if (isinstance(candidate, str) and candidate.startswith("https://")
+                    and len(candidate) <= 2048 and candidate.isprintable()):
+                fix_url = candidate
         elif isinstance(err, str):
             message = err
     if message is None:
         message = raw
     # Redact on EVERY path (extracted message included): a signed URL must never reach the
-    # agent-visible preview, in plain or JSON-escaped form, before the 200-character cut.
-    message = _URL_RE.sub("[url]", message)
-    preview = "".join(ch for ch in message if ch.isprintable() or ch in " \t").strip()[:200]
-    return code, preview
+    # agent-visible preview, in plain, JSON-escaped or unicode-escaped form, before the cut.
+    preview = _redact_urls(message).strip()[:200]
+    return code, preview, fix_url
 
 
 def _network_error_type(exc: Exception) -> str:
@@ -442,6 +487,8 @@ def _request_failed(exc: Exception, *, action: str, mode: str = "quest",
         # Paid-Pollen restriction) and 429 alone is the rate limit. The free-route wording must
         # say "rate-limited": the core's guardrail classifier reads the error TEXT, not error_type.
         detail = f": {exc.body}" if exc.body else ""
+        if exc.fix_url:
+            detail += f" — fix: {exc.fix_url}"
         if exc.status == 401:
             if mode == "free":
                 return fail(
@@ -463,11 +510,18 @@ def _request_failed(exc: Exception, *, action: str, mode: str = "quest",
                     f"Pollinations returned HTTP 402{wait}{detail} — the free classic route is "
                     "rate-limited per IP. Wait, or add POLLINATIONS_API_KEY to skip the throttle.",
                     "rate_limited")
-            if exc.error_code in ("QUEST_POLLEN_ONLY", "QUEST_POLLEN_RESTRICTED"):
+            if exc.error_code == "QUEST_POLLEN_ONLY":
                 return fail(
                     f"Pollinations returned HTTP 402{detail} — this model needs Paid Pollen. "
                     "Pick a Quest-eligible model, or enable 'Include paid models' with a paid "
                     "balance at https://enter.pollinations.ai.", "payment_required")
+            if exc.error_code == "QUEST_POLLEN_RESTRICTED":
+                # The spec publishes this code but documents no prose meaning; word neutrally.
+                return fail(
+                    f"Pollinations returned HTTP 402{detail} — this model is restricted for "
+                    "your key; it may need Paid Pollen or a key permission change. Pick a "
+                    "Quest-eligible model, or check the account at "
+                    "https://enter.pollinations.ai.", "payment_required")
             balance = "Paid Pollen" if mode == "paid" else "Quest Pollen"
             return fail(
                 f"Pollinations returned HTTP 402{detail} — usually the {balance} balance or the "
@@ -483,6 +537,11 @@ def _request_failed(exc: Exception, *, action: str, mode: str = "quest",
                 f"Pollinations returned HTTP 429{wait}{detail} — rate limit reached. Wait for "
                 "the retry window, or check the account at https://enter.pollinations.ai.",
                 "rate_limited")
+        if exc.status == 403:
+            return fail(
+                f"Pollinations returned HTTP 403{detail} — the key lacks permission for this "
+                "model or operation. Check the account and key permissions at "
+                "https://enter.pollinations.ai, or pick another model.", "auth_required")
         return fail(f"Pollinations returned HTTP {exc.status}{detail}", "api_error")
     logger.debug("Pollinations %s (%s) failed", action, mode, exc_info=True)
     # The raw exception can carry a URL with signed query parameters or a parser's wording, so
@@ -498,9 +557,9 @@ def _http_get_bytes(url: str, *, headers: Optional[Dict[str, str]] = None,
     with _ssrf_client(timeout) as client:
         with client.stream("GET", url, headers=headers or {}) as response:
             if response.status_code >= 400:
-                code, preview = _error_fields(response)
+                code, preview, fix_url = _error_fields(response)
                 raise _HTTPError(url, response.status_code, preview,
-                                 _retry_after(response), error_code=code)
+                                 _retry_after(response), error_code=code, fix_url=fix_url)
             return _bounded_read(response, url)
 
 
@@ -515,10 +574,12 @@ def _http_post_json(url: str, *, headers: Dict[str, str], payload: Dict[str, Any
     """
     with _ssrf_client(timeout, follow_redirects=False) as client:
         with client.stream("POST", url, headers=headers, json=payload) as response:
-            if response.status_code >= 400:
-                code, preview = _error_fields(response)
+            # Redirects are not followed, so ANY 3xx is terminal: a redirect carrying a JSON
+            # body must not parse as a completed edit.
+            if response.status_code >= 300:
+                code, preview, fix_url = _error_fields(response)
                 raise _HTTPError(url, response.status_code, preview,
-                                 _retry_after(response), error_code=code)
+                                 _retry_after(response), error_code=code, fix_url=fix_url)
             return json.loads(_bounded_read(response, url))
 
 
@@ -583,9 +644,9 @@ def _http_get_image(url: str, *, headers: Optional[Dict[str, str]] = None,
     with _ssrf_client(timeout) as client:
         with client.stream("GET", url, headers=headers or {}) as response:
             if response.status_code >= 400:
-                code, preview = _error_fields(response)
+                code, preview, fix_url = _error_fields(response)
                 raise _HTTPError(url, response.status_code, preview,
-                                 _retry_after(response), error_code=code)
+                                 _retry_after(response), error_code=code, fix_url=fix_url)
             dims = _parse_image_dimensions(response.headers.get("x-image-dimensions"))
             return _bounded_read(response, url), dims
 
@@ -598,7 +659,9 @@ def _seed_from(kwargs: Dict[str, Any]) -> int:
     possible on models that honor seed (direct provider calls only — the image_generate tool
     exposes no seed parameter). A bool is not a seed. Out-of-range or non-integer
     values fall back to random instead of erroring. When the spec range is unknown the
-    caller's int passes through verbatim and the server validates it.
+    caller's int passes through verbatim and the server validates it. The -1 sentinel is
+    spec-valid on both routes ("random" on GET, the stable compatibility seed on edits) and
+    is forwarded verbatim.
     """
     raw = kwargs.get("seed")
     limits = _spec_limits()
@@ -2244,7 +2307,7 @@ class PollinationsImageGenProvider(ImageGenProvider):
                 message = None
             # Same redaction as the HTTP-error path: a signed URL echoed in a 200 error
             # message must never reach the agent-visible preview.
-            detail = (_text(_URL_RE.sub("[url]", message))
+            detail = (_text(_redact_urls(message))
                       if isinstance(message, str) else "") or "Pollinations reported an error"
             return fail(f"Pollinations could not edit the image: {detail}", "api_error")
         data = answered.get("data")
