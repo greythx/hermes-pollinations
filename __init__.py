@@ -2025,9 +2025,13 @@ def _resolve_model(explicit: Optional[str], catalog: List[Dict[str, Any]]) -> Op
                 # non-paid image entry legitimately claims it as an alias. A paid (or
                 # unreadable) entry must not hijack the user's free model. A normalized
                 # CANONICAL beats an exact alias claim here too (same rule as below).
-                canonical = folded.get(key)
-                if canonical is not None and any(_name_of(m) == canonical for m in catalog):
-                    target = canonical
+                folded_target = folded.get(key)
+                # A folded value is always SOME entry's canonical name; it is a canonical
+                # match for THIS key only when that name itself normalizes to the key. An
+                # alias-derived folded value falls through to the exact-alias lookup, so
+                # case-variant alias collisions rank exactly like the non-classic path.
+                if folded_target is not None and _norm_id(folded_target) == key:
+                    target = folded_target
                 else:
                     target = index.get(wanted) or folded.get(key)
                 entry = _catalog_entry(catalog, target) if target else None
@@ -2036,9 +2040,10 @@ def _resolve_model(explicit: Optional[str], catalog: List[Dict[str, Any]]) -> Op
                 return spelling[key]
             # A normalized CANONICAL beats another model's exact alias (the folded index is
             # canonical-first), so a case variant of a free id cannot be hijacked by a paid
-            # entry claiming the lowercase spelling as an alias.
+            # entry claiming the lowercase spelling as an alias. Alias-derived folded values
+            # are NOT canonical matches: they fall through to the exact-alias ranking below.
             target = folded.get(key)
-            if target is not None and any(_name_of(m) == target for m in catalog):
+            if target is not None and _norm_id(target) == key:
                 return target
             if wanted in index:
                 return index[wanted]

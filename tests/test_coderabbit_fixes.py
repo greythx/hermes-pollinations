@@ -255,6 +255,18 @@ def test_classic_branch_canonical_beats_alias():
     assert mod._resolve_model("picture", [canonical, claimant]) == "Picture"
 
 
+def test_case_variant_alias_collision_exact_wins():
+    mod = _require()
+    first = dict(QUEST, name="first/free", aliases=["Picture"])
+    second = dict(QUEST, name="second/free", aliases=["picture"])
+    # Classic branch: the exact alias claimant wins over the case-folded alias.
+    _setup(mod, catalog=[first, second], classic=["picture"])
+    assert mod._resolve_model("picture", [first, second]) == "second/free"
+    # Non-classic path ranks identically.
+    _setup(mod, catalog=[first, second], classic=[])
+    assert mod._resolve_model("picture", [first, second]) == "second/free"
+
+
 def test_unreadable_billing_hidden_with_toggle_on():
     mod = _require()
     unreadable = {"name": "test/unreadable", "category": "image", "paid_only": [],
