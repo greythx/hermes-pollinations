@@ -1734,7 +1734,11 @@ def _price_label(model: Dict[str, Any], free_classic: bool, has_key: bool,
         if cost == "Free":
             cost = "Free base (variants may cost more)"
         elif "(free variant)" in cost:
-            pass  # the free-variant note already explains the spread; no 'from' on a base figure
+            # The note explains the cheaper direction; still warn about pricier variants.
+            if amount is not None and any(
+                    (rate := _as_number(_as_dict(v).get("completionImageTokens"))) is not None
+                    and rate > amount for v in variants):
+                cost += " (variants may cost more)"
         elif cost.startswith("≈") or cost.startswith("charged per"):
             cost = f"{cost} (variants differ)" if cheaper else f"{cost} (variants may cost more)"
         elif cost not in ("No published price", "usage-based fees"):
@@ -2113,7 +2117,7 @@ def _is_svg_product(model: Optional[Dict[str, Any]]) -> bool:
     ids); over-disabling is the safe failure mode."""
     if not isinstance(model, dict):
         return False
-    if any(isinstance(m, str) and m.strip().lower() == "svg"
+    if any(isinstance(m, str) and m.strip().lower() in ("svg", "image/svg+xml")
            for m in _as_list(model.get("output_modalities"))):
         return True
     text = f"{_text(model.get('title'))} {_text(model.get('description'))}"
@@ -2374,9 +2378,10 @@ class PollinationsImageGenProvider(ImageGenProvider):
                 # the picker offers image models only, matching capabilities() and generate().
                 if not _is_video_model(saved):
                     rows[configured] = _specs(saved, _is_free_classic(saved, classic), has_key)
-                    if _is_svg_product(saved):
-                        # generate() refuses SVG before the paid gate: no toggle/key makes it
-                        # runnable, so the SVG marker supersedes the toggle/key markers.
+                    if _is_svg_product(saved) and (has_key or _classic_id_for(configured, catalog) is None):
+                        # generate() refuses SVG before the paid gate — except a KEYLESS
+                        # classic-served call, which rasterizes to JPEG and runs. Mirror that
+                        # exemption so the marker never contradicts what generate() does.
                         rows[configured]["price"] += " · disabled (SVG output unsupported)"
                     elif has_key and _paid_flag(saved) is not False and not include_paid:
                         # Say plainly that generate() will refuse this row until the toggle

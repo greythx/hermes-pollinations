@@ -201,6 +201,39 @@ def test_retention_classic_normalized_match():
     assert any(r["id"] == "sana" for r in rows), rows
 
 
+def test_retention_svg_marker_keyless_classic_exempt():
+    mod = _require()
+    entry = {"name": "Vector-X-Pro", "aliases": ["vector-x"], "output_modalities": ["svg"],
+             "pricing": {"currency": "pollen", "completionImageTokens": "0.01"}}
+    _setup(mod, catalog=[entry], key=None, config={"model": "Vector-X-Pro"}, classic=["vector-x"])
+    rows = mod.PollinationsImageGenProvider().list_models()
+    row = next(r for r in rows if r["id"] == "Vector-X-Pro")
+    assert "SVG output unsupported" not in row["price"], row["price"]
+    calls = []
+    setattr(mod, "_http_get_image",
+            lambda url, *, headers=None, timeout=120.0: calls.append(url) or (_png(1, 1), None))
+    res = mod.PollinationsImageGenProvider().generate("a cat", model="Vector-X-Pro")
+    assert res["success"] is True, res
+    assert calls and "image.pollinations.ai" in calls[0], calls
+
+
+def test_free_variant_mixed_keeps_pricier_warning():
+    mod = _require()
+    m = dict(QUEST, name="test/mixed",
+             pricing={"currency": "pollen", "completionImageTokens": "0.5"},
+             pricing_variants=[{"name": "free", "completionImageTokens": "0"},
+                               {"name": "2k", "completionImageTokens": "2"}])
+    label = mod._price_label(m, False, True)
+    assert "(free variant)" in label, label
+    assert "(variants may cost more)" in label, label
+
+
+def test_svg_mime_modality_detected():
+    mod = _require()
+    m = {"name": "test/mime-svg", "description": "clean", "output_modalities": ["image/svg+xml"]}
+    assert mod._is_svg_product(m) is True
+
+
 def _main() -> int:
     tests = [(name, fn) for name, fn in sorted(globals().items())
              if name.startswith("test_") and callable(fn)]
