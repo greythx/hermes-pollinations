@@ -945,6 +945,18 @@ def _as_bool(value: Any) -> bool:
     return False
 
 
+def _paid_flag(entry: Optional[Dict[str, Any]]) -> Optional[bool]:
+    """The entry's paid-only class: True/False, or None when the flag is unreadable.
+
+    A non-scalar ``paid_only`` (list/dict) cannot be classified; callers fail CLOSED on None
+    rather than letting _as_bool coerce it to False and spend with the toggle off.
+    """
+    raw = (entry or {}).get("paid_only")
+    if isinstance(raw, (list, dict)):
+        return None
+    return _as_bool(raw)
+
+
 # Catalog text fields are display metadata. The strengths column shows 120 characters and no
 # other consumer reads more than a few hundred, so a field longer than this is truncated before
 # the per-character scan — one absurd catalog entry cannot stall the picker.
@@ -1040,6 +1052,19 @@ def _text(value: Any) -> str:
     if not isinstance(value, str):
         return ""
     return "".join(ch for ch in value[:TEXT_LIMIT] if ch.isprintable() or ch in " \t").strip()
+
+
+def _is_video_model(model: Dict[str, Any]) -> bool:
+    """True when the catalog positively marks the entry as video.
+
+    Retention and generate refuse positively-video entries; an entry with no modality signal
+    at all is ambiguous, not video, and keeps the saved-model visibility convention.
+    """
+    if not isinstance(model, dict):
+        return False
+    if str(model.get("category") or "").strip().lower() == "video":
+        return True
+    return "video" in {str(m).strip().lower() for m in _as_list(model.get("output_modalities"))}
 
 
 def _is_image_model(model: Dict[str, Any]) -> bool:
@@ -1304,7 +1329,7 @@ def _price_label(model: Dict[str, Any], free_classic: bool, has_key: bool,
     classic route even keyed (the enter API does not serve it). ``supported_endpoints`` decides
     edit support, ``flat_rate`` whether the published price is per image or per token.
     """
-    paid_only = _as_bool(model.get("paid_only"))
+    paid_only = _paid_flag(model) is not False
     amount = _as_number(_as_dict(model.get("pricing")).get("completionImageTokens"))
     # The spec guarantees "pollen", but the catalog publishes the currency — read it live.
     currency = _text(_as_dict(model.get("pricing")).get("currency"))[:16] or "pollen"
@@ -1377,13 +1402,44 @@ def _index(catalog: List[Dict[str, Any]]) -> Dict[str, str]:
         name = _name_of(model) if isinstance(model, dict) else None
         if not name:
             continue
-        for key in [name, *[clean for a in _as_list(model.get("aliases"))
-                             if (clean := _text(a))]]:
+        keys = [name, *[clean for a in _as_list(model.get("aliases"))
+                        if (clean := _text(a))]]
+        # The ``id`` fallback is selectable too: a catalog publishing both name and id must
+        # resolve an id-addressed model with its metadata, not as an unknown passthrough.
+        alt = model.get("id")
+        if isinstance(alt, str) and _valid_id(alt) and alt.strip() != name:
+            keys.append(alt.strip())
+        for key in keys:
             if key in out and out[key] != name:
                 logger.debug("Pollinations catalog reuses %r for both %r and %r; keeping %r.",
                              key, out[key], name, out[key])
                 continue
             out[key] = name
+    return out
+
+
+def _folded_index(catalog: List[Dict[str, Any]]) -> Dict[str, str]:
+    """Case-folded name/alias/id -> canonical id, canonical names first (first entry wins).
+
+    Catalog matching is case-insensitive like the classic matching, but the catalog's own
+    spelling is restored, so a case variant of a paid id still reaches the paid gate instead
+    of passing through ungated.
+    """
+    out: Dict[str, str] = {}
+    for model in catalog:
+        name = _name_of(model) if isinstance(model, dict) else None
+        if name:
+            out.setdefault(name.lower(), name)
+    for model in catalog:
+        name = _name_of(model) if isinstance(model, dict) else None
+        if not name:
+            continue
+        keys = [clean for a in _as_list(model.get("aliases")) if (clean := _text(a))]
+        alt = model.get("id")
+        if isinstance(alt, str) and _valid_id(alt):
+            keys.append(alt.strip())
+        for key in keys:
+            out.setdefault(key.lower(), name)
     return out
 
 
@@ -1410,11 +1466,11 @@ def _derived_default(catalog: List[Dict[str, Any]], classic: set,
         if _is_free_classic(model, classic):
             # A free-classic model the catalog also marks paid-only is still usable keyless, but
             # a plainly free one is the better default.
-            if not _as_bool(model.get("paid_only")):
+            if _paid_flag(model) is False:
                 return name
             if free_fallback is None:
                 free_fallback = name
-        if fallback is None and has_key and not _as_bool(model.get("paid_only")):
+        if fallback is None and has_key and _paid_flag(model) is False:
             fallback = name
     if free_fallback:
         return free_fallback
@@ -1427,6 +1483,8 @@ def _derived_default(catalog: List[Dict[str, Any]], classic: set,
 def _resolve_model(explicit: Optional[str], catalog: List[Dict[str, Any]]) -> Optional[str]:
     """First candidate naming a catalog model (canonical id preferred over alias), else passthrough.
 
+    Catalog names/aliases match case-insensitively and restore the catalog's own spelling, so a
+    case variant still reaches the paid gate. A classic-served id outranks a paid alias claim.
     An unknown id passes through verbatim, so a model added upstream works the day it appears —
     with one exception. Hermes injects the shared top-level ``image_gen.model`` as the explicit
     ``model`` kwarg on every tool call, so an unknown value there is usually another provider's
@@ -1438,12 +1496,14 @@ def _resolve_model(explicit: Optional[str], catalog: List[Dict[str, Any]]) -> Op
     ``None`` when nothing is configured and the catalog offers no default to derive.
     """
     index = _index(catalog)
+    folded = _folded_index(catalog)
     config = load_image_gen_config()
     scoped = config.get(PROVIDER_ID)
     shared = config.get("model")
     shared_norm = shared.strip() if isinstance(shared, str) else ""
     has_key = _api_key() is not None
     classic = _classic_set()
+    spelling = _classic_spelling()
     candidates = [
         explicit,
         os.environ.get(MODEL_ENV, "").strip(),
@@ -1458,8 +1518,20 @@ def _resolve_model(explicit: Optional[str], catalog: List[Dict[str, Any]]) -> Op
             canonical = next((_name_of(m) for m in catalog if _name_of(m) == wanted), None)
             if canonical is not None:
                 return canonical
+            key = wanted.lower()
+            if key in spelling:
+                # A classic-served id keeps the endpoint's own spelling unless a readable,
+                # non-paid image entry legitimately claims it as an alias. A paid (or
+                # unreadable) entry must not hijack the user's free model.
+                target = index.get(wanted) or folded.get(key)
+                entry = _catalog_entry(catalog, target) if target else None
+                if entry is not None and _is_image_model(entry) and _paid_flag(entry) is False:
+                    return target
+                return spelling[key]
             if wanted in index:
                 return index[wanted]
+            if key in folded:
+                return folded[key]
     for position, candidate in enumerate(candidates[:3]):
         value = candidate.strip() if isinstance(candidate, str) else ""
         if not value or not _valid_id(value):
@@ -1812,45 +1884,52 @@ class PollinationsImageGenProvider(ImageGenProvider):
         include_paid = has_key and _include_paid_models(self._plugin_id)
 
         rows: Dict[str, Dict[str, Any]] = {}
+        seen_lower: set = set()
         for model in catalog:
             if not _is_image_model(model):
                 continue
             name = _name_of(model)
             if not name:
                 continue
-            if name in rows:
+            if name in rows or name.lower() in seen_lower:
                 logger.debug("Pollinations catalog lists %r more than once; keeping the first.", name)
                 continue
             free_classic = _is_free_classic(model, classic)
             if not free_classic:
                 if not has_key:
                     continue  # state 1: the free classic API is the only keyless route
-                if _as_bool(model.get("paid_only")) and not include_paid:
-                    continue  # state 2: Quest-eligible only
+                if _paid_flag(model) is not False and not include_paid:
+                    continue  # state 2: Quest-eligible only (unreadable flags stay hidden)
             rows[name] = _specs(model, free_classic, has_key)
+            seen_lower.add(name.lower())
 
         if not has_key:
             # The classic endpoint is the source of truth for the keyless route: Pollinations can
             # drop a free model from the catalog while still serving it, and a stale catalog must
             # not leave a keyless user with nothing to pick.
             for key in [item.strip() for item in _classic_models() if _valid_id(item)]:
-                if key not in rows:
+                if key not in rows and key.lower() not in seen_lower:
                     # The classic endpoint publishes no metadata, so the row is built from the id
                     # alone; ``input_modalities`` states what the route accepts.
                     rows[key] = _specs({"name": key, "input_modalities": ["text"]},
                                       True, has_key)
+                    seen_lower.add(key.lower())
 
         configured = _configured_model(catalog)
-        if configured and configured not in rows:
+        if configured and configured not in rows and configured.lower() not in seen_lower:
             saved = next((m for m in catalog if _name_of(m) == configured), None)
-            if saved is not None:
+            if saved is not None and not _is_video_model(saved):
+                # Retention keeps the user's saved model visible — but never a video entry:
+                # the picker offers image models only, matching capabilities() and generate().
                 rows[configured] = _specs(saved, _is_free_classic(saved, classic), has_key)
+                seen_lower.add(configured.lower())
             elif _valid_id(configured) and configured.lower() in classic:
                 # A saved classic-only model the catalog omits: the classic route can still run
                 # it (keyed included), so keep the user's choice visible with an honest label.
                 spelling = _classic_spelling().get(configured.lower(), configured)
                 rows[spelling] = _specs({"name": spelling, "input_modalities": ["text"]},
                                         True, has_key, classic_route=True)
+                seen_lower.add(spelling.lower())
 
         def _order(row: Dict[str, Any]) -> tuple:
             if not has_key and row["free_classic"]:
@@ -1935,17 +2014,29 @@ class PollinationsImageGenProvider(ImageGenProvider):
         entry = _catalog_entry(catalog, model)
         fail = error_factory(PROVIDER_ID, aspect, model=model, prompt=prompt)
 
+        # A known catalog entry must be an image model: a hand-configured video id is refused
+        # here rather than routed to the image endpoint (capabilities already advertises it
+        # text-only, and the picker never offers it).
+        if entry is not None and _is_video_model(entry):
+            return fail(
+                f"Model '{model}' is a video model, not an image model. Pick an image model "
+                "from the picker.", "model_unavailable")
         # The paid toggle gates invocation, not just the picker: a paid-only catalog model must
         # not spend while the setting is off, whichever path (kwarg, env, config) selected it.
+        # An unreadable paid_only flag fails CLOSED — the billing class cannot be verified.
         # Keyless calls keep the free-route guidance below; an id the catalog does not know
         # cannot be classified and passes through as before.
-        if (_api_key() is not None and entry is not None
-                and _as_bool(entry.get("paid_only"))
-                and not _include_paid_models(self._plugin_id)):
-            return fail(
-                f"Model '{model}' is paid-only and 'Include paid models' is off. Enable it "
-                "under Desktop → Settings → Plugins → Pollinations, or pick a Quest-eligible "
-                "model.", "paid_model_disabled")
+        if _api_key() is not None and entry is not None:
+            paid = _paid_flag(entry)
+            if paid is None:
+                return fail(
+                    f"Model '{model}' publishes an unreadable paid_only flag; refusing to run "
+                    "it while its billing class cannot be verified.", "model_unavailable")
+            if paid and not _include_paid_models(self._plugin_id):
+                return fail(
+                    f"Model '{model}' is paid-only and 'Include paid models' is off. Enable it "
+                    "under Desktop → Settings → Plugins → Pollinations, or pick a Quest-eligible "
+                    "model.", "paid_model_disabled")
 
         # A source image means an edit, which only the enter API can do; the free classic route
         # is text-to-image only, so there is nothing to fall back to. Dedupe order-preserving:
