@@ -416,7 +416,9 @@ def _read_prefix(response: Any, limit: int) -> bytes:
 # (bounded passes), strips control characters that could split a URL, then matches http(s)
 # and protocol-relative // URLs whose tail allows apostrophes and stops at whitespace,
 # double quotes and backslashes; bare credential query tails are masked separately.
-_ESCAPE_RE = re.compile(r"\\+u([0-9a-fA-F]{4})|\\+(/)")
+# Backslash runs are bounded: an unbounded \\+ backtracks O(n^2) on a hostile 64KB
+# backslash flood (~26s). Realistic JSON escape nesting needs only a few per layer.
+_ESCAPE_RE = re.compile(r"\\{1,8}u([0-9a-fA-F]{4})|\\{1,8}(/)")
 _URL_RE = re.compile(r"(?:https?:)?//[^\s\"\\]*", re.IGNORECASE)
 _SECRET_TAIL_RE = re.compile(
     r"([#?&](?:sig|signature|token|access_token|accessToken|access-token|api_key|api-key|apikey|"
@@ -494,7 +496,9 @@ def _error_fields(response: Any) -> tuple[Optional[str], str, Optional[str]]:
                 # userinfo so nothing sensitive or injectable reaches the agent-visible error.
                 base = candidate.split("?", 1)[0].split("#", 1)[0]
                 authority = base[len("https://"):].split("/", 1)[0]
-                if "@" not in authority:
+                # ASCII-only authority: UTS46 maps fullwidth ＼/﹨/＠ to \/@, which browsers
+                # read as authority separators (host spoofing). Legitimate fix hosts are ASCII.
+                if "@" not in authority and authority.isascii():
                     fix_url = base
         elif isinstance(err, str):
             message = err
@@ -1699,16 +1703,26 @@ def _price_label(model: Dict[str, Any], free_classic: bool, has_key: bool,
         folded = True
     elif unit == "megapixel":
         # rate x quantity is the published per-unit figure — show it (no area assumption).
-        cost = f"≈{_format_price(_variant_floor(model, amount) * _pricing_quantity(model), currency)} per megapixel"
+        # A zero-rate variant must not erase a paid base: show the base + a free-variant note.
+        floor = _variant_floor(model, amount)
+        shown = amount if floor == 0 else floor
+        cost = f"≈{_format_price(shown * _pricing_quantity(model), currency)} per megapixel"
+        if floor == 0:
+            cost += " (free variant)"
     elif unit and unit not in ("image", "images", "generation", "token", "tokens"):
         # e.g. "byte": a generic per-unit charge, display-bounded like every label field.
         cost = f"charged per {unit[:32]}"
     elif not flat or unit in ("token", "tokens"):
         cost = "charged per token"
     else:
-        # The per-image figure includes convertible per-generation fees so the label and the
-        # sort estimate agree.
-        cost = _format_price(_variant_floor(model, amount) + fees, currency)
+        # The per-image figure includes convertible per-generation fees and the unit quantity
+        # so the label and the sort estimate agree. A zero-rate variant must not erase a paid
+        # base: show the base figure + a free-variant note (the sort keeps the true floor).
+        floor = _variant_floor(model, amount)
+        shown = amount if floor == 0 else floor
+        cost = _format_price(shown * _pricing_quantity(model) + fees, currency)
+        if floor == 0:
+            cost += " (free variant)"
         folded = True
     # A model priced per variant (a 2K tier, an edit operation) can cost more than the base
     # figure the picker shows: a numeric floor reads "from X"; a per-unit figure says so.
@@ -1719,6 +1733,8 @@ def _price_label(model: Dict[str, Any], free_classic: bool, has_key: bool,
             and 0 <= rate < amount for v in variants)
         if cost == "Free":
             cost = "Free base (variants may cost more)"
+        elif "(free variant)" in cost:
+            pass  # the free-variant note already explains the spread; no 'from' on a base figure
         elif cost.startswith("≈") or cost.startswith("charged per"):
             cost = f"{cost} (variants differ)" if cheaper else f"{cost} (variants may cost more)"
         elif cost not in ("No published price", "usage-based fees"):
@@ -2097,6 +2113,9 @@ def _is_svg_product(model: Optional[Dict[str, Any]]) -> bool:
     ids); over-disabling is the safe failure mode."""
     if not isinstance(model, dict):
         return False
+    if any(isinstance(m, str) and m.strip().lower() == "svg"
+           for m in _as_list(model.get("output_modalities"))):
+        return True
     text = f"{_text(model.get('title'))} {_text(model.get('description'))}"
     return _SVG_PRODUCT_RE.search(text) is not None
 
@@ -2355,17 +2374,21 @@ class PollinationsImageGenProvider(ImageGenProvider):
                 # the picker offers image models only, matching capabilities() and generate().
                 if not _is_video_model(saved):
                     rows[configured] = _specs(saved, _is_free_classic(saved, classic), has_key)
-                    if has_key and _paid_flag(saved) is not False and not include_paid:
+                    if _is_svg_product(saved):
+                        # generate() refuses SVG before the paid gate: no toggle/key makes it
+                        # runnable, so the SVG marker supersedes the toggle/key markers.
+                        rows[configured]["price"] += " · disabled (SVG output unsupported)"
+                    elif has_key and _paid_flag(saved) is not False and not include_paid:
                         # Say plainly that generate() will refuse this row until the toggle
                         # is on, rather than offering an unrunnable choice unexplained.
                         rows[configured]["price"] += " · disabled (paid toggle off)"
-                    if not has_key and not _is_free_classic(saved, classic):
+                    elif not has_key and not _is_free_classic(saved, classic):
                         rows[configured]["price"] += " · disabled (needs a key)"
                     seen_lower.add(configured.lower())
-            elif _valid_id(configured) and configured.lower() in classic:
+            elif _valid_id(configured) and _norm_id(configured) in classic:
                 # A saved classic-only model the catalog omits: the classic route can still run
                 # it (keyed included), so keep the user's choice visible with an honest label.
-                spelling = _classic_spelling().get(configured.lower(), configured)
+                spelling = _classic_spelling().get(_norm_id(configured), configured)
                 rows[spelling] = _specs({"name": spelling, "input_modalities": ["text"]},
                                         True, has_key, classic_route=True)
                 seen_lower.add(spelling.lower())
@@ -2484,12 +2507,14 @@ class PollinationsImageGenProvider(ImageGenProvider):
             return fail(
                 f"Model '{model}' is a video model, not an image model. Pick an image model "
                 "from the picker.", "model_unavailable")
-        if entry is not None and _is_svg_product(entry) and _classic_id_for(model, catalog) is None:
+        if entry is not None and _is_svg_product(entry):
             # The enter route would return SVG, which the raster output gate refuses AFTER
-            # billing. Refuse before the request; a classic-served model rasterizes to JPEG.
-            return fail(
-                f"Model '{model}' produces SVG output, which this plugin cannot return. "
-                "Pick a raster image model from the picker.", "unsupported")
+            # billing. Only a KEYLESS classic-served call rasterizes to JPEG: keyed, a
+            # catalog-listed model routes to enter even when classic serves it.
+            if not (_api_key() is None and _classic_id_for(model, catalog) is not None):
+                return fail(
+                    f"Model '{model}' produces SVG output, which this plugin cannot return. "
+                    "Pick a raster image model from the picker.", "unsupported")
         # The paid toggle gates invocation, not just the picker: a paid-only catalog model must
         # not spend while the setting is off, whichever path (kwarg, env, config) selected it.
         # An unreadable paid_only flag fails CLOSED — the billing class cannot be verified.
