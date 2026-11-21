@@ -6,20 +6,21 @@ image-gen backend. It works with no account. A key unlocks the full catalog.
 ## Three states
 
 The picker lists only models your current setup can run — except your saved model,
-which stays visible so it never silently disappears. Generation still refuses what the
-current state forbids.
+which stays visible whenever the current state can run it (a retained paid row is marked
+disabled). Generation still refuses what the current state forbids.
 
 | State | What you get |
 | --- | --- |
 | No API key | The model the free route serves today. Watermarked, throttled per IP, and capped at a reduced size. |
-| API key added | The rest of the catalog Pollinations publishes. No watermark, no per-IP throttle. |
+| API key added | The rest of the catalog Pollinations publishes. No watermark, no per-IP throttle — except a classic-served model the catalog omits, which keeps the watermarked classic route even keyed. |
 | Key plus "Include paid models" | The full catalog, paid-only models included — and permitted to run. |
 
 The toggle sits under Desktop → Settings → Plugins → Pollinations. It ships off. While it is
 off, paid-only models are both hidden from the picker and refused at generation time. A model
 id the catalog does not list cannot be classified and is sent as-is — except an unknown shared
 `image_gen.model` value, which falls back to the live default (it is usually another provider's
-leftover id), unless the free classic API serves it.
+leftover id), unless the free classic API serves it. Keyless, an unknown id the free classic
+API does not serve is likewise ignored in favor of the live default.
 
 ## Setup
 
@@ -54,8 +55,9 @@ A caller-provided `seed` is honored for reproducible images on models that suppo
 passed programmatically (the `image_generate` tool does not expose one); otherwise each call
 gets a fresh random seed.
 
-If the catalog is unreachable and nothing is cached, the plugin offers no model rather than
-guessing at one that may no longer exist.
+If neither the catalog nor the free-model list is reachable and nothing is cached, the plugin
+offers no model rather than guessing at one that may no longer exist. Keyless, a reachable or
+cached free-model list still works while the catalog is down.
 
 The resolution control appears only with a key set, for models that publish a tier Hermes
 can express (1K/2K).
@@ -73,8 +75,12 @@ can express (1K/2K).
   request URL path (they may appear in intermediary access logs); edit prompts travel in the
   request body.
 - The free route watermarks images and caps output at a reduced size.
-- Generated images are written to `$HERMES_HOME/cache/generated/images/`. The model catalog
-  and the free-model list are cached under `$HERMES_HOME/cache/`.
+- Generated images are written to `$HERMES_HOME/cache/generated/images/`. The model catalog,
+  the free-model list and the API spec limits are cached under `$HERMES_HOME/cache/`
+  (`pollinations_catalog.json`, `pollinations_classic_models.json`, `pollinations_spec_limits.json`).
+- The free classic route's model list (`image.pollinations.ai/models`) and its `model` parameter
+  are live surfaces the classic docs do not fully document; the plugin reads them defensively
+  and degrades when they are unreachable.
 - Paid-only models spend real money from your Pollinations balance. They stay hidden and are
   refused at generation time until you turn the toggle on. A model id the catalog does not
   list cannot be classified and is sent as-is (with the shared-config exception above).

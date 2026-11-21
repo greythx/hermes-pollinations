@@ -10,6 +10,7 @@ Stdlib-only: run ``python3 tests/test_state_consistency.py``.
 
 from __future__ import annotations
 
+import base64
 import importlib.util
 import shutil
 import sys
@@ -146,6 +147,28 @@ def test_retained_paid_row_carries_disabled_hint():
     rows = mod.PollinationsImageGenProvider().list_models()
     row = next(r for r in rows if r["id"] == "test/paid-edit")
     assert "disabled" not in row["price"].lower(), row["price"]
+
+
+def test_future_aspect_ratio_degrades_to_square():
+    mod = _require()
+    _setup(mod, catalog=[QUEST])
+    orig_aspect = mod.resolve_aspect_ratio
+    orig_get_image = getattr(mod, "_http_get_image", None)
+    setattr(mod, "resolve_aspect_ratio", lambda a: "wide")
+    png = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kg"
+        "AAAABJRU5ErkJggg==")
+    setattr(mod, "_http_get_image", lambda url, *, headers=None, timeout=120.0: (png, None))
+    setattr(mod, "save_b64_image",
+            lambda b64, *, prefix="image", extension="png": f"/tmp/{prefix}_test.{extension}")
+    try:
+        res = mod.PollinationsImageGenProvider().generate("a cat", model="test/quest-model")
+        assert res["success"] is True, res
+        assert res["width"] == 1024 and res["height"] == 1024, res
+    finally:
+        setattr(mod, "resolve_aspect_ratio", orig_aspect)
+        if orig_get_image is not None:
+            setattr(mod, "_http_get_image", orig_get_image)
 
 
 def _main() -> int:

@@ -160,8 +160,10 @@ EDIT_HINT_MODELS = 3
 # trusted, so a shape change upstream cannot silently mislabel rows.
 CACHE_SCHEMA = 1
 
-# Semantic aspect -> pixel size; satisfies every per-model size constraint the spec currently
-# publishes. The free classic route keeps the aspect ratio within its own smaller area cap.
+# Semantic aspect -> pixel size. Verified at authoring time against every per-model size
+# constraint the spec publishes in prose (no machine-readable per-model constraints exist);
+# re-verify when the spec changes. The free classic route keeps the aspect ratio within its
+# own smaller area cap.
 SIZES: Dict[str, tuple[int, int]] = {
     "landscape": (1280, 768),
     "square": (1024, 1024),
@@ -641,6 +643,60 @@ def _jpeg_dimensions(raw: bytes) -> Optional[tuple[int, int]]:
             width = int.from_bytes(raw[pos + 5:pos + 7], "big")
             return (width, height) if width > 0 and height > 0 else None
         pos += length
+    return None
+
+
+def _png_dimensions(raw: bytes) -> Optional[tuple[int, int]]:
+    """Pixel size from a PNG's IHDR (width/height are the first 8 bytes of chunk data)."""
+    if len(raw) < 24 or raw[:8] != b"\x89PNG\r\n\x1a\n" or raw[12:16] != b"IHDR":
+        return None
+    width = int.from_bytes(raw[16:20], "big")
+    height = int.from_bytes(raw[20:24], "big")
+    return (width, height) if width > 0 and height > 0 else None
+
+
+def _gif_dimensions(raw: bytes) -> Optional[tuple[int, int]]:
+    """Pixel size from a GIF's logical screen descriptor (little-endian, bytes 6..10)."""
+    if len(raw) < 10 or raw[:6] not in (b"GIF87a", b"GIF89a"):
+        return None
+    width = int.from_bytes(raw[6:8], "little")
+    height = int.from_bytes(raw[8:10], "little")
+    return (width, height) if width > 0 and height > 0 else None
+
+
+def _webp_dimensions(raw: bytes) -> Optional[tuple[int, int]]:
+    """Pixel size from a WebP's first chunk (VP8X canvas, VP8L packed bits, or VP8 frame)."""
+    if len(raw) < 20 or raw[:4] != b"RIFF" or raw[8:12] != b"WEBP":
+        return None
+    chunk = raw[12:16]
+    if chunk == b"VP8X" and len(raw) >= 30:
+        return (int.from_bytes(raw[24:27], "little") + 1,
+                int.from_bytes(raw[27:30], "little") + 1)
+    if chunk == b"VP8L" and len(raw) >= 25 and raw[20] == 0x2F:
+        bits = int.from_bytes(raw[21:25], "little")
+        return ((bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1)
+    if chunk == b"VP8 " and len(raw) >= 30 and raw[23:26] == b"\x9d\x01\x2a":
+        width = int.from_bytes(raw[26:28], "little") & 0x3FFF
+        height = int.from_bytes(raw[28:30], "little") & 0x3FFF
+        return (width, height) if width > 0 and height > 0 else None
+    return None
+
+
+def _image_dimensions(raw: bytes, mime: Optional[str]) -> Optional[tuple[int, int]]:
+    """Produced pixel size measured structurally from decoded image bytes (no decode).
+
+    Used when the API does not announce the produced size: the classic route clamps silently,
+    and an edit may be resized server-side. None when unmeasurable; the caller keeps the
+    requested dimensions.
+    """
+    if mime == "image/jpeg":
+        return _jpeg_dimensions(raw)
+    if mime == "image/png":
+        return _png_dimensions(raw)
+    if mime == "image/gif":
+        return _gif_dimensions(raw)
+    if mime == "image/webp":
+        return _webp_dimensions(raw)
     return None
 
 
@@ -1261,7 +1317,7 @@ def _edit_url(entry: Optional[Dict[str, Any]]) -> str:
 def _reference_cap(entry: Optional[Dict[str, Any]]) -> int:
     """The catalog's published reference-image cap, ceilinged; a conservative default otherwise.
 
-    Published caps observed to date range 1-16. Models that publish none (mostly community
+    Published caps observed to date range 0-16 (0 disables edits). Models that publish none (mostly community
     endpoints) get a conservative default rather than the ceiling: such endpoints commonly
     accept a single image, and over-sending would 400. An explicit cap is honored up to the
     ceiling; a published 0 means no reference images and disables edits for the entry.
@@ -1518,8 +1574,8 @@ def _price_label(model: Dict[str, Any], free_classic: bool, has_key: bool,
 def _iso_date(model: Dict[str, Any]) -> str:
     """The catalog's ``added_date`` as a day, whatever unit it is in.
 
-    The field is documented as milliseconds, but a switch to seconds would otherwise render every
-    model as 1970, so the magnitude decides.
+    The spec publishes a number with no unit description; live data is milliseconds, but a
+    switch to seconds would otherwise render every model as 1970, so the magnitude decides.
     """
     raw = model.get("added_date")
     if not _is_number(raw):
@@ -1823,7 +1879,9 @@ def _to_data_url(value: str, limit: int = MAX_INPUT_IMAGE_BYTES) -> str:
         header, _, data = candidate.partition(",")
         if not header.lower().startswith("data:image/") or ";base64" not in header.lower():
             raise ValueError("source image data URL must be a base64 image")
-        if (len(data) * 3) // 4 > limit:
+        # Exact decoded length: the naive (len*3)//4 overestimates by the base64 padding
+        # (up to 2 bytes), falsely rejecting an exactly-at-cap image that local/URL accept.
+        if (len(data) * 3) // 4 - data.count("=") > limit:
             raise ValueError(f"source image exceeds {limit} bytes")
         return _encode_input_image(base64.b64decode(data, validate=True))
     return _local_image_to_data_url(candidate, limit)
@@ -2193,7 +2251,9 @@ class PollinationsImageGenProvider(ImageGenProvider):
                       "reached and no model is configured; check your connection and try again.",
                 error_type="no_model_available", provider=PROVIDER_ID, prompt=prompt,
                 aspect_ratio=aspect)
-        width, height = SIZES[aspect]
+        # A future core aspect ratio degrades to square instead of raising KeyError out of
+        # generate() (the bundled SIZES.get convention).
+        width, height = SIZES.get(aspect) or SIZES["square"]
         entry = _catalog_entry(catalog, model)
         fail = error_factory(PROVIDER_ID, aspect, model=model, prompt=prompt)
 
@@ -2329,7 +2389,8 @@ class PollinationsImageGenProvider(ImageGenProvider):
         # budget, and each source is read/encoded under the REMAINING budget (converted back to
         # raw bytes), so a small reference still fits after a large one. Rejecting early keeps
         # transient memory bounded instead of encoding an image that cannot fit.
-        overhead = len(prompt) + 1024
+        # The prompt is JSON-encoded as UTF-8: count bytes, not code points.
+        overhead = len(prompt.encode("utf-8")) + 1024
         try:
             for source in sources:
                 remaining = MAX_EDIT_PAYLOAD_BYTES - total - overhead
@@ -2342,6 +2403,8 @@ class PollinationsImageGenProvider(ImageGenProvider):
                         "prompt). Use fewer or smaller images.", "invalid_input")
                 data_url = _to_data_url(source, limit=raw_limit)
                 total += len(data_url)
+                # Belt-and-suspenders: the remaining-budget conversion above already keeps
+                # the total inside the cap; this re-check guards any future arithmetic drift.
                 if total + overhead > MAX_EDIT_PAYLOAD_BYTES:
                     return fail(
                         f"Those reference images are too large to send "
@@ -2415,6 +2478,7 @@ class PollinationsImageGenProvider(ImageGenProvider):
         url = item.get("url")
         encoded = item.get("b64_json")
         remote = False
+        produced: Optional[tuple[int, int]] = None
         if isinstance(encoded, str) and encoded:
             if encoded.startswith("data:"):  # tolerate a prefixed payload
                 encoded = encoded.partition(",")[2]
@@ -2428,6 +2492,7 @@ class PollinationsImageGenProvider(ImageGenProvider):
                             "invalid_response")
             if not _image_is_complete(raw, sniffed):
                 return fail("Pollinations returned an incomplete image", "invalid_response")
+            produced = _image_dimensions(raw, sniffed)
             try:
                 image_ref = str(save_b64_image(
                     encoded, prefix="pollinations", extension=_extension_for(sniffed, "")))
@@ -2452,6 +2517,11 @@ class PollinationsImageGenProvider(ImageGenProvider):
             return fail("Pollinations returned neither image data nor a URL", "empty_response")
 
         extra = {"width": width, "height": height, "mode": "edit", "sources": len(sources)}
+        if produced is not None:
+            # The edit may be resized server-side; report the measured size, keeping the
+            # request alongside for transparency (URL responses are not fetched: requested).
+            extra["requested_width"], extra["requested_height"] = width, height
+            extra["width"], extra["height"] = produced
         if remote:
             # The bytes were not fetched, so the file may not exist yet or may be unreachable.
             extra["remote"] = True
