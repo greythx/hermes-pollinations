@@ -308,8 +308,20 @@ class _FakeClient:
 
 def test_remote_ssrf_blocked():
     mod = _require()
-    assert _raises(lambda: mod._remote_image_to_data_url("http://169.254.169.254/latest/meta-data"))
-    assert _raises(lambda: mod._remote_image_to_data_url("http://127.0.0.1:8080/x.png"))
+    _setup(mod)
+
+    def no_network(timeout, **kw):
+        raise AssertionError("SSRF guard let a private address reach the HTTP client")
+
+    setattr(mod, "_ssrf_client", no_network)
+    # Assert the GUARD rejects (its specific error), not just that some ValueError happens:
+    # a regressed guard would reach no_network and fail loudly instead of passing vacuously.
+    for url in ("http://169.254.169.254/latest/meta-data", "http://127.0.0.1:8080/x.png"):
+        try:
+            mod._remote_image_to_data_url(url)
+            raise AssertionError(f"SSRF guard did not block {url}")
+        except ValueError as exc:
+            assert "SSRF" in str(exc), (url, exc)
 
 
 def test_remote_content_length_and_body():
