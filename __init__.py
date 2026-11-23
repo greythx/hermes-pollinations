@@ -1632,12 +1632,25 @@ def _price_class(model: Dict[str, Any]) -> int:
     return 1
 
 
+def _variant_rate(variant: Any) -> Optional[float]:
+    """Published rate for one pricing variant.
+
+    The live catalog nests it under ``variant["pricing"]["completionImageTokens"]``; older
+    snapshots and test fixtures publish it at the top level. Accept both shapes.
+    """
+    data = _as_dict(variant)
+    rate = _as_number(_as_dict(data.get("pricing")).get("completionImageTokens"))
+    if rate is None:
+        rate = _as_number(data.get("completionImageTokens"))
+    return rate
+
+
 def _variant_floor(model: Dict[str, Any], base: float) -> float:
     """Lowest published per-image rate across base and variants: a 'from' figure must be a
     true floor (a live variant can be cheaper than the base rate)."""
     floor = base
     for variant in _as_list(model.get("pricing_variants")):
-        rate = _as_number(_as_dict(variant).get("completionImageTokens"))
+        rate = _variant_rate(variant)
         if rate is not None and 0 <= rate < floor:
             floor = rate
     return floor
@@ -1800,14 +1813,14 @@ def _price_label(model: Dict[str, Any], free_classic: bool, has_key: bool,
     variants = _as_list(model.get("pricing_variants"))
     if variants:
         cheaper = amount is not None and any(
-            (rate := _as_number(_as_dict(v).get("completionImageTokens"))) is not None
+            (rate := _variant_rate(v)) is not None
             and 0 <= rate < amount for v in variants)
         if cost == "Free":
             cost = "Free base (variants may cost more)"
         elif "(free variant)" in cost or "(variant " in cost:
             # The note explains the cheaper direction; still warn about pricier variants.
             if amount is not None and any(
-                    (rate := _as_number(_as_dict(v).get("completionImageTokens"))) is not None
+                    (rate := _variant_rate(v)) is not None
                     and rate > amount for v in variants):
                 cost += " (variants may cost more)"
         elif cost.startswith("≈") or cost.startswith("charged per"):

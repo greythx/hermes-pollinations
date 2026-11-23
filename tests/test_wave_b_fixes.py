@@ -264,11 +264,13 @@ def test_variant_floor_truthful():
     mod = _require()
     m = dict(QUEST, name="test/variants",
              pricing={"currency": "pollen", "completionImageTokens": "0.06"},
-             pricing_variants=[{"name": "low_1k", "completionImageTokens": "0.04"}])
+             pricing_variants=[{"name": "low_1k",
+                                "pricing": {"completionImageTokens": "0.04"}}])
     label = mod._price_label(m, False, True)
     assert label.startswith("from 0.04 pollen"), label
     assert mod._price_value(m) == 0.04, mod._price_value(m)
-    dearer = dict(m, pricing_variants=[{"name": "2k", "completionImageTokens": "0.09"}])
+    dearer = dict(m, pricing_variants=[{"name": "2k",
+                                       "pricing": {"completionImageTokens": "0.09"}}])
     assert mod._price_label(dearer, False, True).startswith("from 0.06 pollen")
     assert mod._price_value(dearer) == 0.06
 
