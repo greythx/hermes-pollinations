@@ -425,8 +425,10 @@ def _read_prefix(response: Any, limit: int) -> bytes:
 # double quotes and backslashes; bare credential query tails are masked separately. A
 # tail may start at a ';' too (bare path/authority forms), with optional spaces before the
 # key, and '=' may be percent-encoded (%3D). One bounded regex handles all of them: no
-# backtracking loop, and the value class stays linear.  A ';' tail naming a generic word
-# (code/key) is prose and is left alone; real credential names still mask.
+# backtracking loop, and the value class stays linear.  The value class also excludes ';'
+# so each semicolon-delimited field is matched on its own: a prose '; code=404' cannot
+# swallow a later '; sig=SECRET' that still needs masking. A ';' tail naming a generic
+# word (code/key) is prose and is left alone; real credential names still mask.
 # Backslash runs are bounded: an unbounded \\+ backtracks O(n^2) on a hostile 64KB
 # backslash flood (~26s). Realistic JSON escape nesting needs only a few per layer.
 _ESCAPE_RE = re.compile(r"\\{1,8}u([0-9a-fA-F]{4})|\\{1,8}(/)")
@@ -435,7 +437,7 @@ _SECRET_TAIL_RE = re.compile(
     r"([#?&;][ \t]*(?:sig|signature|token|access_token|accessToken|access-token|api_key|api-key|apikey|"
     r"key|password|secret|auth|credential|client_secret|refresh_token|policy|key-pair-id|code|"
     r"session|sid|jwt|bearer|x-amz-[a-z0-9-]+|x-goog-[a-z0-9-]+)(?:=|%3d))"
-    r"[^\s\"&\\]*", re.IGNORECASE)
+    r"[^\s\"&\\;]*", re.IGNORECASE)
 # Display clamp for an absurd Retry-After, not an API fact.
 RETRY_AFTER_MAX = 86400
 
