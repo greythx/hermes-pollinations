@@ -61,6 +61,24 @@ def test_schemeless_host_path_code_then_signature_secret_is_masked():
     assert "host/x; code=404" in out, out
 
 
+def test_url_attached_semicolon_secret_spaced_and_unspaced():
+    """A URL's trailing ';' must not hide the credential field after it."""
+    spaced = MOD._redact_urls(f"https://host/p; sig={SECRET}")
+    assert SECRET not in spaced, spaced
+    assert spaced == "[url]; sig=[redacted]", spaced
+
+    unspaced = MOD._redact_urls(f"https://host/p;sig={SECRET}")
+    assert SECRET not in unspaced, unspaced
+    assert unspaced == "[url];sig=[redacted]", unspaced
+
+
+def test_url_with_semicolons_still_masks_its_url_portion():
+    """Legitimate URLs containing ';' still get the URL itself masked."""
+    out = MOD._redact_urls("see https://host/a;b?c=1;d=2 now")
+    assert out == "see [url];b?c=1;d=2 now", out
+    assert "https://host/a" not in out, out
+
+
 def test_existing_prose_and_query_secrets_keep_their_behavior():
     """GREEN assertions carried forward from the earlier redaction rounds."""
     for text in ("; code=404 is common", "; key=value in config",
