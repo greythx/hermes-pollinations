@@ -421,17 +421,29 @@ def _read_prefix(response: Any, limit: int) -> bytes:
 # URLs in raw error text can be JSON-escaped (https:\/\/), double-escaped, or unicode-
 # escaped in ANY scheme character (\u0068ttps\u003a//). _redact_urls decodes those spellings
 # (bounded passes), strips control characters that could split a URL, then matches http(s)
-# and protocol-relative // URLs whose tail allows apostrophes and stops at whitespace,
-# double quotes and backslashes; bare credential query tails are masked separately.
-# Backslash runs are bounded: an unbounded \\+ backtracks O(n^2) on a hostile 64KB
-# backslash flood (~26s). Realistic JSON escape nesting needs only a few per layer.
+# and protocol-relative // URLs.  The tail allows apostrophes and internal semicolons, and
+# stops at whitespace, double quotes and backslashes.  A ';' is consumed as PART of the
+# contiguous URL only when a lookahead shows the next character exists and is NOT
+# whitespace, a double quote or a backslash; otherwise the ';' is left unconsumed so the
+# following semicolon-delimited field stays visible to _SECRET_TAIL_RE.  That makes
+# 'https://host/a;b?c=1;d=2' one opaque [url] while preserving '; sig=SECRET' (and
+# ';sig=SECRET', whose ';' IS consumed, fully masking the whole string) for masking.
+# Each alternation branch consumes exactly one character, so the match stays linear: no
+# nested quantifiers, no O(n^2) backtracking on a hostile 64KB semicolon/backslash flood.
+# A tail may start at a ';' too (bare path/authority forms), with optional spaces before
+# the key, and '=' may be percent-encoded (%3D); one bounded regex handles those tails.
+# The value class excludes ';' so each field is scanned on its own: a prose '; code=404'
+# cannot swallow a later '; sig=SECRET' that still needs masking.  A ';' field naming a
+# generic word (code/key) is prose and is left alone; real credential names still mask.
+# Backslash runs in escape decoding are bounded: an unbounded \\+ backtracks O(n^2) on a
+# hostile 64KB backslash flood (~26s). Realistic JSON escape nesting needs only a few.
 _ESCAPE_RE = re.compile(r"\\{1,8}u([0-9a-fA-F]{4})|\\{1,8}(/)")
-_URL_RE = re.compile(r"(?:https?:)?//[^\s\"\\]*", re.IGNORECASE)
+_URL_RE = re.compile(r"(?:https?:)?//(?:[^\s\"\\;]|;(?=[^\s\"\\]))*", re.IGNORECASE)
 _SECRET_TAIL_RE = re.compile(
-    r"([#?&](?:sig|signature|token|access_token|accessToken|access-token|api_key|api-key|apikey|"
+    r"([#?&;][ \t]*(?:sig|signature|token|access_token|accessToken|access-token|api_key|api-key|apikey|"
     r"key|password|secret|auth|credential|client_secret|refresh_token|policy|key-pair-id|code|"
-    r"session|sid|jwt|bearer|x-amz-[a-z0-9-]+|x-goog-[a-z0-9-]+)=)"
-    r"[^\s\"&\\]*", re.IGNORECASE)
+    r"session|sid|jwt|bearer|x-amz-[a-z0-9-]+|x-goog-[a-z0-9-]+)(?:=|%3d))"
+    r"[^\s\"&\\;]*", re.IGNORECASE)
 # Display clamp for an absurd Retry-After, not an API fact.
 RETRY_AFTER_MAX = 86400
 
@@ -443,6 +455,22 @@ def _unescape_match(match: Any) -> str:
     if 0xD800 <= cp <= 0xDFFF:
         return ""  # a lone surrogate is not displayable text
     return chr(cp)
+
+
+# A bare ';' also introduces ordinary prose ("; code=404 is common"), so only
+# credential-shaped keys are masked after ';'.  Generic words need a URL/query
+# introducer (#, ?, &) to count as a secret tail; '; sig=SECRET' still masks.
+_SEMI_PROSE_KEYS = {"code", "key"}
+_SEMI_KEY_RE = re.compile(r"^;[ \t]*([a-z][a-z0-9_-]*)(?:=|%3d)", re.IGNORECASE)
+
+
+def _mask_secret_tail(match: Any) -> str:
+    intro_and_key = match.group(1)
+    if intro_and_key.startswith(";"):
+        key = _SEMI_KEY_RE.match(intro_and_key)
+        if key is not None and key.group(1).lower() in _SEMI_PROSE_KEYS:
+            return match.group(0)  # prose after ';', leave the tail untouched
+    return intro_and_key + "[redacted]"
 
 
 def _redact_urls(text: str) -> str:
@@ -462,7 +490,7 @@ def _redact_urls(text: str) -> str:
     text = re.sub(r"(https?:)/(?!/)", r"\1//", text)
     text = "".join(ch for ch in text if ch.isprintable() or ch in " \t")
     text = _URL_RE.sub("[url]", text)
-    return _SECRET_TAIL_RE.sub(r"\1[redacted]", text)
+    return _SECRET_TAIL_RE.sub(_mask_secret_tail, text)
 
 
 def _error_fields(response: Any) -> tuple[Optional[str], str, Optional[str]]:
@@ -1632,12 +1660,25 @@ def _price_class(model: Dict[str, Any]) -> int:
     return 1
 
 
+def _variant_rate(variant: Any) -> Optional[float]:
+    """Published rate for one pricing variant.
+
+    The live catalog nests it under ``variant["pricing"]["completionImageTokens"]``; older
+    snapshots and test fixtures publish it at the top level. Accept both shapes.
+    """
+    data = _as_dict(variant)
+    rate = _as_number(_as_dict(data.get("pricing")).get("completionImageTokens"))
+    if rate is None:
+        rate = _as_number(data.get("completionImageTokens"))
+    return rate
+
+
 def _variant_floor(model: Dict[str, Any], base: float) -> float:
     """Lowest published per-image rate across base and variants: a 'from' figure must be a
     true floor (a live variant can be cheaper than the base rate)."""
     floor = base
     for variant in _as_list(model.get("pricing_variants")):
-        rate = _as_number(_as_dict(variant).get("completionImageTokens"))
+        rate = _variant_rate(variant)
         if rate is not None and 0 <= rate < floor:
             floor = rate
     return floor
@@ -1800,14 +1841,14 @@ def _price_label(model: Dict[str, Any], free_classic: bool, has_key: bool,
     variants = _as_list(model.get("pricing_variants"))
     if variants:
         cheaper = amount is not None and any(
-            (rate := _as_number(_as_dict(v).get("completionImageTokens"))) is not None
+            (rate := _variant_rate(v)) is not None
             and 0 <= rate < amount for v in variants)
         if cost == "Free":
             cost = "Free base (variants may cost more)"
         elif "(free variant)" in cost or "(variant " in cost:
             # The note explains the cheaper direction; still warn about pricier variants.
             if amount is not None and any(
-                    (rate := _as_number(_as_dict(v).get("completionImageTokens"))) is not None
+                    (rate := _variant_rate(v)) is not None
                     and rate > amount for v in variants):
                 cost += " (variants may cost more)"
         elif cost.startswith("≈") or cost.startswith("charged per"):
@@ -2037,6 +2078,16 @@ def _resolve_model(explicit: Optional[str], catalog: List[Dict[str, Any]]) -> Op
                 entry = _catalog_entry(catalog, target) if target else None
                 if entry is not None and _is_image_model(entry) and _paid_flag(entry) is False:
                     return target
+                # R6-01: a paid-only (or unreadable) CANONICAL catalog entry that is also
+                # classic-served must keep its canonical spelling. Returning the endpoint's
+                # case variant here makes _catalog_entry(catalog, model) miss it and skips the
+                # paid gate, running the paid model on the free watermarked route. An
+                # alias-derived folded value is NOT a canonical match (it normalizes to a
+                # different key), so a paid alias still cannot hijack a free classic id.
+                if (folded_target is not None and _norm_id(folded_target) == key
+                        and entry is not None and _is_image_model(entry)
+                        and _paid_flag(entry) is not False):
+                    return folded_target
                 return spelling[key]
             # A normalized CANONICAL beats another model's exact alias (the folded index is
             # canonical-first), so a case variant of a free id cannot be hijacked by a paid
