@@ -312,6 +312,27 @@ MUTATIONS: List[Dict[str, Any]] = [
         "old_string": "    except ImportError:\n        _unlink_planted_symlink(path)\n        atomic_json_write(path, payload)\n        return True\n",
         "new_string": "    except ImportError:\n        _unlink_planted_symlink(path)\n        return False  # CG_cache_write_fallback\n",
     },
+    {
+        "name": 'R6_1_variant_floor_legacy_only',
+        "description": 'Variant floor reads only the legacy top-level rate: live nested pricing_variants are ignored.',
+        "finding": 'R6-1: live catalog nests the variant rate under variant.pricing.completionImageTokens.',
+        "old_string": '        rate = _variant_rate(variant)\n',
+        "new_string": '        rate = _as_number(_as_dict(variant).get("completionImageTokens"))  # R6_1_variant_floor_legacy_only\n',
+    },
+    {
+        "name": 'R6_01_classic_paid_passthrough',
+        "description": 'Paid canonical classic id regains its endpoint spelling: the paid gate cannot see it.',
+        "finding": 'R6-01: a paid-only canonical classic-served id must keep canonical spelling so the gate fires.',
+        "old_string": '                if (folded_target is not None and _norm_id(folded_target) == key\n                        and entry is not None and _is_image_model(entry)\n                        and _paid_flag(entry) is not False):\n                    return folded_target\n',
+        "new_string": '                if False:  # R6_01_classic_paid_passthrough\n                    return folded_target\n',
+    },
+    {
+        "name": 'R6_2_secret_tail_no_semicolon',
+        "description": 'Semicolon-separated credential tails are no longer redacted.',
+        "finding": "R6-2: bare '; sig=SECRET' credential tails must be masked.",
+        "old_string": '    r"([#?&;][ \\t]*(?:sig|signature|token|',
+        "new_string": '    r"([#?&][ \\t]*(?:sig|signature|token|',
+    },
 ]
 
 NON_MUTABLE = [
