@@ -2050,6 +2050,16 @@ def _resolve_model(explicit: Optional[str], catalog: List[Dict[str, Any]]) -> Op
                 entry = _catalog_entry(catalog, target) if target else None
                 if entry is not None and _is_image_model(entry) and _paid_flag(entry) is False:
                     return target
+                # R6-01: a paid-only (or unreadable) CANONICAL catalog entry that is also
+                # classic-served must keep its canonical spelling. Returning the endpoint's
+                # case variant here makes _catalog_entry(catalog, model) miss it and skips the
+                # paid gate, running the paid model on the free watermarked route. An
+                # alias-derived folded value is NOT a canonical match (it normalizes to a
+                # different key), so a paid alias still cannot hijack a free classic id.
+                if (folded_target is not None and _norm_id(folded_target) == key
+                        and entry is not None and _is_image_model(entry)
+                        and _paid_flag(entry) is not False):
+                    return folded_target
                 return spelling[key]
             # A normalized CANONICAL beats another model's exact alias (the folded index is
             # canonical-first), so a case variant of a free id cannot be hijacked by a paid
