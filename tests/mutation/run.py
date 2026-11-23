@@ -29,6 +29,13 @@ def main(argv=None) -> int:
                         help="report only; never fail on survivors")
     args = parser.parse_args(argv)
 
+    # A stale or broken catalog must fail loudly, never silently score mutants.
+    try:
+        catalog.validate(harness.source_text())
+    except (AssertionError, SyntaxError) as exc:
+        print("Mutation catalog invalid: %s" % exc, file=sys.stderr)
+        return 2
+
     if args.only:
         entry = catalog.by_name(args.only)
         if entry is None:
@@ -45,15 +52,21 @@ def main(argv=None) -> int:
               file=sys.stderr)
         for line in base["failures"]:
             print("  ", line, file=sys.stderr)
+        for line in base.get("aborts", []):
+            print("  ", line, file=sys.stderr)
         return 2
     print("Baseline suite: %d passed / 0 failed / %d skipped across %d files\n" %
           (base["passed"], base["skipped"], len(base["files"])))
 
-    killed, survived = [], []
+    killed, survived, aborted = [], [], []
     started = time.time()
     for entry in selected:
         result = harness.run_suite(entry, label=entry["name"])
-        if result["killed"]:
+        if result.get("aborted"):
+            aborted.append(entry["name"])
+            print("%-32s ABORT     (%s)" %
+                  (entry["name"], ", ".join(result.get("aborts", [])[:1])))
+        elif result["killed"]:
             killed.append(entry["name"])
             print("%-32s KILLED   (%d failing: %s)" %
                   (entry["name"], result["failed"], ", ".join(result["failures"][:2])))
@@ -62,9 +75,13 @@ def main(argv=None) -> int:
             print("%-32s SURVIVED" % entry["name"])
         sys.stdout.flush()
 
-    print("\nSummary: %d killed / %d survived / %d total  (%.1fs)" %
-          (len(killed), len(survived), len(selected), time.time() - started))
+    print("\nSummary: %d killed / %d survived / %d aborted / %d total  (%.1fs)" %
+          (len(killed), len(survived), len(aborted), len(selected),
+           time.time() - started))
     print("Survived: %s" % (", ".join(survived) if survived else "(none)"))
+    if aborted:
+        print("Aborted: %s" % ", ".join(aborted))
+        return 1  # an abort is an infrastructure error, not a survivable mutant
     return 0 if args.baseline or not survived else 1
 
 

@@ -7,7 +7,9 @@ scratch directory by ``tests/mutation/harness.py``.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import subprocess
 import sys
 import tempfile
@@ -27,6 +29,20 @@ def _load_harness():
             spec.loader.exec_module(module)
             return module
     raise unittest.SkipTest("tests/mutation/harness.py not found")
+
+
+def _load_run():
+    """Load run.py from the repo (works from the repo and from scratch)."""
+    for parent in Path(__file__).resolve().parents:
+        candidate = parent / "mutation" / "run.py"
+        if candidate.is_file():
+            spec = importlib.util.spec_from_file_location(
+                "mutation_run_under_test", candidate)
+            assert spec is not None and spec.loader is not None
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module
+    raise unittest.SkipTest("tests/mutation/run.py not found")
 
 
 HARNESS = _load_harness()
@@ -106,15 +122,79 @@ def test_nonzero_exit_with_existing_kill_preserves_counts_without_double_count()
     assert statuses == {"test_fake_runner": "FAIL"}, statuses
 
 
-def test_nonzero_exit_without_parsed_statuses_keeps_runner_crash_error():
-    """GREEN: the existing <runner-crash> ERROR path stays intact."""
+def test_unparseable_runner_output_is_harness_abort_not_kill():
+    """RED: no parseable statuses means a harness abort, never a mutation kill."""
     result = _run_with("runner exploded before tests\n", 1,
                        "unit_nonzero_nostatus")
+    assert result["aborted"] is True, result
+    assert len(result["aborts"]) == 1, result
+    assert "runner-crash" in result["aborts"][0], result
+    assert result["failed"] == 0, result
+    assert result["failures"] == [], result
+    assert result["killed"] is False, result
     assert result["all_pass"] is False, result
-    assert result["failed"] == 1, result
-    assert result["failures"] == ["test_fake_runner.py::<runner-crash> [ERROR]"], result
     statuses = result["per_file"]["test_fake_runner.py"]["statuses"]
-    assert statuses == {"<runner-crash>": "ERROR"}, statuses
+    assert statuses == {}, statuses
+
+
+def test_run_main_aborts_when_catalog_validation_fails():
+    """RED: main() must call catalog.validate and abort on a broken catalog."""
+    mod = _load_run()
+    seen = []
+
+    def boom(source):
+        seen.append(source)
+        raise AssertionError("bad anchor")
+
+    orig_validate, orig_run_suite = mod.catalog.validate, mod.harness.run_suite
+    mod.catalog.validate = boom
+    mod.harness.run_suite = lambda *a, **k: {
+        "all_pass": True, "killed": False, "aborted": False,
+        "passed": 1, "failed": 0, "skipped": 0, "failures": [], "files": []}
+    try:
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            rc = mod.main([])
+    finally:
+        mod.catalog.validate = orig_validate
+        mod.harness.run_suite = orig_run_suite
+    assert seen, "catalog.validate was never called by run.main()"
+    assert rc != 0, rc
+
+
+def test_run_main_exits_nonzero_when_a_mutation_aborts():
+    """RED: a harness abort must fail the gate, not count as a kill."""
+    mod = _load_run()
+    fake_entry = {"name": "fake_abort", "description": "test", "finding": "test",
+                  "old_string": "x", "new_string": "y"}
+    labels = []
+
+    def fake_run_suite(entry=None, *, label="run", **kwargs):
+        labels.append(label)
+        if label == "__sanity__":
+            return {"all_pass": True, "killed": False, "aborted": False,
+                    "passed": 1, "failed": 0, "skipped": 0, "failures": [],
+                    "files": []}
+        return {"all_pass": False, "killed": False, "aborted": True,
+                "passed": 0, "failed": 0, "skipped": 0, "failures": [],
+                "files": [], "aborts": ["test_x.py::runner-crash"]}
+
+    orig_validate, orig_mut, orig_run = (mod.catalog.validate,
+                                         mod.catalog.MUTATIONS,
+                                         mod.harness.run_suite)
+    mod.catalog.validate = lambda source: None
+    mod.catalog.MUTATIONS = [fake_entry]
+    mod.harness.run_suite = fake_run_suite
+    try:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            rc = mod.main([])
+    finally:
+        mod.catalog.validate = orig_validate
+        mod.catalog.MUTATIONS = orig_mut
+        mod.harness.run_suite = orig_run
+    assert labels.count("fake_abort") == 1, labels
+    assert "ABORT" in buf.getvalue(), buf.getvalue()
+    assert rc != 0, rc
 
 
 def _main() -> int:

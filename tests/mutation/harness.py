@@ -7,7 +7,9 @@ catalog mutation applied -- copies the full suite beside it, and runs each test
 as ``python tests/test_NAME.py``.  The scratch directory is removed afterwards.
 
 A mutation is KILLED when at least one test FAILs/ERRORs, SURVIVED when every
-test passes (SKIP is not a kill).  Baseline runs use no mutation.
+test passes (SKIP is not a kill).  Baseline runs use no mutation.  A file whose
+output has no parseable test status is a harness ABORT (recorded in ``aborts``,
+never in ``failures``): it must fail the gate instead of scoring as a kill.
 """
 
 from __future__ import annotations
@@ -89,6 +91,7 @@ def run_suite(mutation: Optional[Dict[str, Any]] = None, *, label: str = "run",
     env = dict(os.environ)
     per_file: Dict[str, Dict[str, Any]] = {}
     failures: List[str] = []
+    aborts: List[str] = []
     passed = failed = skipped = 0
 
     for test in tests:
@@ -105,7 +108,17 @@ def run_suite(mutation: Optional[Dict[str, Any]] = None, *, label: str = "run",
 
         statuses = parse_output(output)
         if not statuses:
-            statuses = {"<runner-crash>": "ERROR"}
+            # No parseable test status: the runner itself failed before any test
+            # reported. This is a harness abort, NOT a mutation kill -- scoring
+            # it as a kill would let a SyntaxError inflate the gate.
+            aborts.append("%s::runner-crash [returncode=%d]" %
+                          (test.name, returncode))
+            per_file[test.name] = {
+                "returncode": returncode,
+                "statuses": {},
+                "abort": True,
+            }
+            continue
         for name, status in statuses.items():
             if status in _KILL:
                 failed += 1
@@ -135,8 +148,10 @@ def run_suite(mutation: Optional[Dict[str, Any]] = None, *, label: str = "run",
         "failed": failed,
         "skipped": skipped,
         "failures": failures,
+        "aborted": bool(aborts),
+        "aborts": aborts,
         "killed": bool(failures),
-        "all_pass": not failures,
+        "all_pass": not failures and not aborts,
     }
     if not keep:
         shutil.rmtree(work, ignore_errors=True)
