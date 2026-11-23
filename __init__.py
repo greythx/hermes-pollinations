@@ -425,7 +425,8 @@ def _read_prefix(response: Any, limit: int) -> bytes:
 # double quotes and backslashes; bare credential query tails are masked separately. A
 # tail may start at a ';' too (bare path/authority forms), with optional spaces before the
 # key, and '=' may be percent-encoded (%3D). One bounded regex handles all of them: no
-# backtracking loop, and the value class stays linear.
+# backtracking loop, and the value class stays linear.  A ';' tail naming a generic word
+# (code/key) is prose and is left alone; real credential names still mask.
 # Backslash runs are bounded: an unbounded \\+ backtracks O(n^2) on a hostile 64KB
 # backslash flood (~26s). Realistic JSON escape nesting needs only a few per layer.
 _ESCAPE_RE = re.compile(r"\\{1,8}u([0-9a-fA-F]{4})|\\{1,8}(/)")
@@ -448,6 +449,22 @@ def _unescape_match(match: Any) -> str:
     return chr(cp)
 
 
+# A bare ';' also introduces ordinary prose ("; code=404 is common"), so only
+# credential-shaped keys are masked after ';'.  Generic words need a URL/query
+# introducer (#, ?, &) to count as a secret tail; '; sig=SECRET' still masks.
+_SEMI_PROSE_KEYS = {"code", "key"}
+_SEMI_KEY_RE = re.compile(r"^;[ \t]*([a-z][a-z0-9_-]*)(?:=|%3d)", re.IGNORECASE)
+
+
+def _mask_secret_tail(match: Any) -> str:
+    intro_and_key = match.group(1)
+    if intro_and_key.startswith(";"):
+        key = _SEMI_KEY_RE.match(intro_and_key)
+        if key is not None and key.group(1).lower() in _SEMI_PROSE_KEYS:
+            return match.group(0)  # prose after ';', leave the tail untouched
+    return intro_and_key + "[redacted]"
+
+
 def _redact_urls(text: str) -> str:
     """Decode escape spellings, then redact URLs and bare credential query tails.
 
@@ -465,7 +482,7 @@ def _redact_urls(text: str) -> str:
     text = re.sub(r"(https?:)/(?!/)", r"\1//", text)
     text = "".join(ch for ch in text if ch.isprintable() or ch in " \t")
     text = _URL_RE.sub("[url]", text)
-    return _SECRET_TAIL_RE.sub(r"\1[redacted]", text)
+    return _SECRET_TAIL_RE.sub(_mask_secret_tail, text)
 
 
 def _error_fields(response: Any) -> tuple[Optional[str], str, Optional[str]]:

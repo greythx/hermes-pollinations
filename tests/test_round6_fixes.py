@@ -157,6 +157,17 @@ def test_secret_tails_semicolon_and_percent_encoded_redacted():
         assert MOD._redact_urls(text) == text, text
 
 
+def test_semicolon_does_not_redact_generic_prose_keys():
+    """F7-2: '; code=404' and '; key=note' are prose, not credential tails."""
+    for text in ("; code=404 is common", "host/x; key=note is prose"):
+        out = MOD._redact_urls(text)
+        assert out == text, (text, out)
+        assert "[redacted]" not in out, (text, out)
+    # The real credential spellings must still be masked.
+    for text in ("host/x; sig=LEAKME_SIGNED_9988", "host/x?sig%3DLEAKME_SIGNED_9988"):
+        assert "[redacted]" in MOD._redact_urls(text), text
+
+
 def _main() -> int:
     tests = [(name, fn) for name, fn in sorted(globals().items())
              if name.startswith("test_") and callable(fn)]
