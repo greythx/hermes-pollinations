@@ -90,11 +90,11 @@ These already had coverage in the v1.7.0 + PR #5 suite; retained as permanent re
 
 ## Final gate (this commit)
 
-- **Suite:** **302 passed / 0 failed / 0 skipped across 27 stdlib test files** (295 passed / 26 files at `0afc0d6`, plus 4 harness unit tests, 2 gate-abort tests and 1 F7-2 redaction test).
+- **Suite:** **313 passed / 0 failed / 0 skipped across 28 stdlib test files** (derivation: 295 passed / 26 files at `0afc0d6`; 302 passed / 27 files at `c1d8a2a` after adding 4 harness unit tests, 2 gate-abort tests and 1 F7-2 redaction test; 313 passed / 28 files at `f1ca245` after adding 3 more harness tests and 8 Round-8 tests in `test_round8_fixes.py`).
 - **Catalog:** **45 entries** (42 baseline + 3 Round-6 mutants). `catalog.validate(harness.source_text())` runs at the start of `run.py main()` and passes: every `old_string` occurs exactly once and every mutant compiles.
-- **`python tests/mutation/harness.py`:** `baseline: 302 passed, 0 failed, 0 skipped`; exit 0.
+- **`python tests/mutation/harness.py`:** `baseline: 313 passed, 0 failed, 0 skipped`; exit 0.
 - **`python tests/mutation/run.py`:** **45 killed / 0 survived / 0 aborted / 45 total** (961.8s), exit 0.
-- **Full suite:** 302 passed / 0 failed / 0 skipped across 27 files; exit 0.
+- **Full suite:** 313 passed / 0 failed / 0 skipped across 28 files; exit 0.
 - **`hermes plugins validate . --json`:** `ok: true` (15 checks; one expected private-core-import warning).
 - **Runner semantics:** a nonzero exit WITH parsed statuses and no kill adds a `runner-error` ERROR kill (a real kill — tests ran). A run with NO parseable status is a harness ABORT, recorded in `aborted`/`aborts`, never in `failures`, and makes the gate exit nonzero.
 - **F7-2:** `; code=404` / `; key=note` prose is left intact; `; sig=SECRET` and `?sig%3DSECRET` are still redacted.
