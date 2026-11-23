@@ -197,6 +197,61 @@ def test_run_main_exits_nonzero_when_a_mutation_aborts():
     assert rc != 0, rc
 
 
+def test_harness_main_exits_nonzero_when_suite_aborts():
+    """RED: harness __main__ must report aborts and exit nonzero for the gate."""
+    aborted = {
+        "mutation": "baseline", "passed": 0, "failed": 0, "skipped": 0,
+        "failures": [], "aborted": True,
+        "aborts": ["test_x.py::runner-crash [returncode=2]"],
+    }
+    original = HARNESS.run_suite
+    HARNESS.run_suite = lambda *a, **k: aborted
+    try:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            rc = HARNESS.main()
+    finally:
+        HARNESS.run_suite = original
+    assert rc != 0, rc
+    assert "aborted" in out.getvalue().lower(), out.getvalue()
+    assert "runner-crash" in out.getvalue(), out.getvalue()
+
+
+def test_harness_main_exits_nonzero_on_unexpected_error():
+    """RED: an unexpected harness exception must not be reported as success."""
+    def boom(*args, **kwargs):
+        raise RuntimeError("harness blew up")
+
+    original = HARNESS.run_suite
+    HARNESS.run_suite = boom
+    try:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            rc = HARNESS.main()
+    finally:
+        HARNESS.run_suite = original
+    assert rc != 0, rc
+    assert "harness blew up" in out.getvalue(), out.getvalue()
+
+
+def test_harness_main_exits_zero_on_clean_selftest():
+    """GREEN: a clean no-mutation selftest keeps its zero exit and prints aborts=0."""
+    clean = {
+        "mutation": "baseline", "passed": 3, "failed": 0, "skipped": 0,
+        "failures": [], "aborted": False, "aborts": [],
+    }
+    original = HARNESS.run_suite
+    HARNESS.run_suite = lambda *a, **k: clean
+    try:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            rc = HARNESS.main()
+    finally:
+        HARNESS.run_suite = original
+    assert rc == 0, rc
+    assert "0 aborted" in out.getvalue(), out.getvalue()
+
+
 def _main() -> int:
     tests = [(n, f) for n, f in sorted(globals().items())
              if n.startswith("test_") and callable(f)]

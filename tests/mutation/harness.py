@@ -158,10 +158,30 @@ def run_suite(mutation: Optional[Dict[str, Any]] = None, *, label: str = "run",
     return result
 
 
-if __name__ == "__main__":
-    result = run_suite(label="harness_selftest")
-    print("%s: %d passed, %d failed, %d skipped" %
+def main() -> int:
+    """Run the clean no-mutation selftest and return a gate-ready exit code.
+
+    An abort means a test file could not be scored, and an unexpected exception
+    means the harness itself broke; neither may be reported as success.
+    """
+    try:
+        result = run_suite(label="harness_selftest")
+    except Exception as exc:
+        print("harness selftest aborted: %s: %s" %
+              (type(exc).__name__, exc), file=sys.stderr)
+        return 1
+    aborts = result.get("aborts", [])
+    print("%s: %d passed, %d failed, %d skipped, %d aborted" %
           (result["mutation"], result["passed"], result["failed"],
-           result["skipped"]))
+           result["skipped"], len(aborts)))
     for line in result["failures"]:
         print("  KILLED:", line)
+    for line in aborts:
+        print("  ABORT:", line, file=sys.stderr)
+    if result.get("aborted") or aborts or result.get("failures"):
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
