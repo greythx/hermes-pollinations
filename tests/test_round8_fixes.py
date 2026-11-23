@@ -10,6 +10,7 @@ from __future__ import annotations
 import importlib.util
 import shutil
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -69,14 +70,58 @@ def test_url_attached_semicolon_secret_spaced_and_unspaced():
 
     unspaced = MOD._redact_urls(f"https://host/p;sig={SECRET}")
     assert SECRET not in unspaced, unspaced
-    assert unspaced == "[url];sig=[redacted]", unspaced
+    # An unspaced ';' is consumed by the contiguous URL, so the whole string is
+    # one URL and is fully masked (no credential field survives to be scanned).
+    assert unspaced in ("[url];sig=[redacted]", "[url]"), unspaced
 
 
-def test_url_with_semicolons_still_masks_its_url_portion():
-    """Legitimate URLs containing ';' still get the URL itself masked."""
+def test_internal_semicolon_url_redacted_without_tail_leak():
+    """RED (CodeRabbit R3): a contiguous URL's internal ';' are part of the URL.
+
+    'see https://host/a;b?c=1;d=2 now' must redact the WHOLE URL to '[url]'
+    with no ';b?c=1;d=2' tail left behind.
+    """
     out = MOD._redact_urls("see https://host/a;b?c=1;d=2 now")
-    assert out == "see [url];b?c=1;d=2 now", out
+    assert out == "see [url] now", out
+    assert ";" not in out, out
     assert "https://host/a" not in out, out
+
+
+def test_semicolon_url_fix_preserves_green_behavior():
+    """GREEN: credential-field and prose behavior must survive the URL fix."""
+    # A ';' followed by whitespace is NOT consumed by the URL: the field after
+    # it stays visible to _SECRET_TAIL_RE and is masked there.
+    assert MOD._redact_urls(f"https://host/p; sig={SECRET}") == \
+        "[url]; sig=[redacted]"
+    # A ';' followed by a double quote is likewise unconsumed: the URL stops
+    # at the quote and the credential field after the ';' is masked separately.
+    assert MOD._redact_urls(f'https://host/p"; sig={SECRET}') == \
+        '[url]"; sig=[redacted]'
+    # Unspaced credential field: fully masked as one URL is acceptable.
+    unspaced = MOD._redact_urls(f"https://host/p;sig={SECRET}")
+    assert SECRET not in unspaced, unspaced
+    assert unspaced in ("[url];sig=[redacted]", "[url]"), unspaced
+    # Standalone semicolon prose is unchanged; a secret after it still masks.
+    assert MOD._redact_urls("; code=404 is common") == "; code=404 is common"
+    secret_prose = MOD._redact_urls(f"; code=404; sig={SECRET}")
+    assert SECRET not in secret_prose, secret_prose
+    assert "[redacted]" in secret_prose, secret_prose
+    assert "; code=404" in secret_prose, secret_prose
+    # JSON-escaped and unicode-escaped scheme URLs still redact.
+    for text in (r"https:\/\/host/a?sig=SECRET",
+                 r"\u0068ttps://host/a?sig=SECRET"):
+        out = MOD._redact_urls(text)
+        assert "SECRET" not in out, (text, out)
+        assert "[url]" in out, (text, out)
+
+
+def test_semicolon_url_regex_has_no_catastrophic_backtracking():
+    """A 64KB semicolon/backslash flood must redact in well under 0.5s."""
+    flood = "https://" + ";\\" * 32768  # 65536 flood chars
+    started = time.monotonic()
+    MOD._redact_urls(flood)
+    elapsed = time.monotonic() - started
+    assert elapsed < 0.5, "redaction took %.3fs on a 64KB flood" % elapsed
 
 
 def test_existing_prose_and_query_secrets_keep_their_behavior():
