@@ -114,6 +114,13 @@ def run_suite(mutation: Optional[Dict[str, Any]] = None, *, label: str = "run",
                 skipped += 1
             else:
                 passed += 1
+        if returncode != 0 and not any(s in _KILL for s in statuses.values()):
+            # A nonzero exit with no parsed kill is still a runner failure;
+            # recording it keeps killed/all_pass honest without double-counting
+            # a kill that was already parsed from this file's output.
+            statuses["runner-error"] = "ERROR"
+            failed += 1
+            failures.append("%s::runner-error [ERROR]" % test.name)
         per_file[test.name] = {
             "returncode": returncode,
             "statuses": statuses,
