@@ -422,15 +422,18 @@ def _read_prefix(response: Any, limit: int) -> bytes:
 # escaped in ANY scheme character (\u0068ttps\u003a//). _redact_urls decodes those spellings
 # (bounded passes), strips control characters that could split a URL, then matches http(s)
 # and protocol-relative // URLs whose tail allows apostrophes and stops at whitespace,
-# double quotes and backslashes; bare credential query tails are masked separately.
+# double quotes and backslashes; bare credential query tails are masked separately. A
+# tail may start at a ';' too (bare path/authority forms), with optional spaces before the
+# key, and '=' may be percent-encoded (%3D). One bounded regex handles all of them: no
+# backtracking loop, and the value class stays linear.
 # Backslash runs are bounded: an unbounded \\+ backtracks O(n^2) on a hostile 64KB
 # backslash flood (~26s). Realistic JSON escape nesting needs only a few per layer.
 _ESCAPE_RE = re.compile(r"\\{1,8}u([0-9a-fA-F]{4})|\\{1,8}(/)")
 _URL_RE = re.compile(r"(?:https?:)?//[^\s\"\\]*", re.IGNORECASE)
 _SECRET_TAIL_RE = re.compile(
-    r"([#?&](?:sig|signature|token|access_token|accessToken|access-token|api_key|api-key|apikey|"
+    r"([#?&;][ \t]*(?:sig|signature|token|access_token|accessToken|access-token|api_key|api-key|apikey|"
     r"key|password|secret|auth|credential|client_secret|refresh_token|policy|key-pair-id|code|"
-    r"session|sid|jwt|bearer|x-amz-[a-z0-9-]+|x-goog-[a-z0-9-]+)=)"
+    r"session|sid|jwt|bearer|x-amz-[a-z0-9-]+|x-goog-[a-z0-9-]+)(?:=|%3d))"
     r"[^\s\"&\\]*", re.IGNORECASE)
 # Display clamp for an absurd Retry-After, not an API fact.
 RETRY_AFTER_MAX = 86400

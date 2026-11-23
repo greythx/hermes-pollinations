@@ -135,6 +135,28 @@ def test_classic_paid_canonical_gated_both_paths():
     assert captured["headers"].get("Authorization") == "Bearer sk_dummy", captured
 
 
+def test_secret_tails_semicolon_and_percent_encoded_redacted():
+    sentinel = "LEAKME_SIGNED_9988"
+    tails = [
+        f"host/x; sig={sentinel}",
+        f"host/x; sig={sentinel}; next=1",
+        f"host/x?sig%3D{sentinel}",
+        f"host/x&sig%3d{sentinel}",
+        f"host/x#sig%3D{sentinel}",
+    ]
+    for text in tails:
+        out = MOD._redact_urls(text)
+        assert sentinel not in out, (text, out)
+        assert "[redacted]" in out, (text, out)
+    # Existing query-introducer spelling still masks, and ordinary prose is byte-identical.
+    assert "[redacted]" in MOD._redact_urls(f"host/x?sig={sentinel}")
+    for text in ("a normal sentence about sigmas and keys",
+                 "host/x?user=alice&page=2",
+                 "press ; then type = to continue",
+                 "host/x; signature pending approval"):
+        assert MOD._redact_urls(text) == text, text
+
+
 def _main() -> int:
     tests = [(name, fn) for name, fn in sorted(globals().items())
              if name.startswith("test_") and callable(fn)]
