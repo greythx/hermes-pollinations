@@ -75,9 +75,17 @@ These already have coverage in the v1.7.0 + PR #5 suite; retained as permanent r
 
 - **V1 test-fixture placement** — a test-quality fix: a vacuous test was re-fixtured so the signed URL sits inside both the 64KiB read prefix and the 200-char preview with a positive `[url]` assert. It changes no plugin behavior, so no source transform can represent it. Its behavior is guarded by `M2_redaction_off` / `M2_*` and the preview tests.
 
+## Final gate (after the PR #5 test-hardening commits)
+
+- Unmutated sanity suite: **292 passed / 0 failed / 0 skipped across 25 files** (274 original + 18 new RED/minimal-guard tests).
+- `python tests/mutation/run.py` → **42 killed / 0 survived / 42 total**, exit 0.
+- Every one of the 9 baseline survivors is killed by both a RED test (`tests/test_mutation_red.py`) and a minimal guard (`tests/test_mutation_guards.py`); each RED test was verified to FAIL on its mutant with `run.py --only NAME` before the guards landed.
+- No survivor was declared equivalent: all 9 have a concrete real-vs-mutant behavioral difference (see the RED test docstrings).
+
 ## Reproduce
 
 ```sh
 python tests/mutation/run.py --baseline
 python tests/mutation/run.py --only M1_alias_shadow
+python tests/mutation/run.py        # gate: exits 0 only when all 42 are killed
 ```
